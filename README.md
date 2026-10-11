@@ -66,22 +66,15 @@ The Docker image runs the Next.js standalone Node server (`node server.js`) on p
 | `SSH_HOST`, `SSH_PORT`, `SSH_USERNAME`, `SSH_PRIVATE_KEY` / `SSH_PASSWORD`, `SSH_PASSPHRASE` | same as E-Farmer |
 | `APP_FOLDER` | same as E-Farmer (the folder under `/home` holding `docker-compose.yml`) |
 | `PAT` | GitHub token with read access to this repo |
-| `PORTFOLIO_REPO_NAME` | `frank-portfolio` (repo name = folder name = compose service name) |
-| `DEVELOP_PORTFOLIO_REPO_NAME` | e.g. `frank-portfolio-develop` (only if you deploy `develop`) |
+| `PORTFOLIO_REPO_NAME` | name of this GitHub repo (also the folder it is cloned into) |
+| `DEVELOP_PORTFOLIO_REPO_NAME` | folder for the `develop` clone, e.g. `frank-portfolio-develop` (only if you deploy `develop`) |
 
-**One-time server setup.** Add the service to `/home/<APP_FOLDER>/docker-compose.yml`:
+**No server-side compose edits are needed.** The CD runs this repo's own `docker-compose.yml` as a separate compose project, so it never touches the other services in `/home/<APP_FOLDER>/docker-compose.yml`:
 
-```yaml
-  frank-portfolio:
-    build:
-      context: frank-portfolio/.
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    ports:
-      - "3011:3011"
-```
-
-To deploy `develop` too, add a `frank-portfolio-develop` service to `docker-compose-develop.yml` with context `frank-portfolio-develop/.` and another port (e.g. `PORT=3012` and `"3012:3012"`).
+| Branch | Compose project | Port |
+|---|---|---|
+| `main` | `frank-portfolio` | 3011 |
+| `develop` | `frank-portfolio-develop` | 3012 |
 
 **Point the domain at the container.** In Plesk, under *frankfontcha.tech*, turn off the old Node.js app, then in *Apache & nginx Settings → Additional nginx directives* add:
 

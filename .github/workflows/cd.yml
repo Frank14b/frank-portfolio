@@ -42,15 +42,18 @@ jobs:
               git status
             fi
 
-            # No .env step: the portfolio is a static export with no environment variables.
+            # No .env step: the portfolio has no environment variables.
 
-            cd "$APP_FOLDER"
-            docker-compose -f docker-compose-develop.yml stop ${{secrets.DEVELOP_PORTFOLIO_REPO_NAME}}
+            # The portfolio ships its own docker-compose.yml, so it runs as its own compose
+            # project and never touches the other apps in $APP_FOLDER/docker-compose.yml.
+            cd "$REPO_FOLDER"
+            export PORT=3012
+            docker-compose -p frank-portfolio-develop -f docker-compose.yml stop frank-portfolio
             docker system prune -af
 
-            docker-compose -f docker-compose-develop.yml build --no-cache ${{secrets.DEVELOP_PORTFOLIO_REPO_NAME}}
+            docker-compose -p frank-portfolio-develop -f docker-compose.yml build --no-cache frank-portfolio
 
-            docker-compose -f docker-compose-develop.yml up -d ${{secrets.DEVELOP_PORTFOLIO_REPO_NAME}}
+            docker-compose -p frank-portfolio-develop -f docker-compose.yml up -d frank-portfolio
 
       - name: Deploy using ssh on Production
         if: github.ref == 'refs/heads/main'
@@ -84,12 +87,15 @@ jobs:
               git status
             fi
 
-            # No .env step: the portfolio is a static export with no environment variables.
+            # No .env step: the portfolio has no environment variables.
 
-            cd "$APP_FOLDER"
-            docker-compose -f docker-compose.yml stop ${{secrets.PORTFOLIO_REPO_NAME}}
+            # The portfolio ships its own docker-compose.yml, so it runs as its own compose
+            # project and never touches the other apps in $APP_FOLDER/docker-compose.yml.
+            cd "$REPO_FOLDER"
+            export PORT=3011
+            docker-compose -p frank-portfolio -f docker-compose.yml stop frank-portfolio
             docker system prune -af
 
-            docker-compose -f docker-compose.yml build --no-cache ${{secrets.PORTFOLIO_REPO_NAME}}
+            docker-compose -p frank-portfolio -f docker-compose.yml build --no-cache frank-portfolio
 
-            docker-compose -f docker-compose.yml up -d ${{secrets.PORTFOLIO_REPO_NAME}}
+            docker-compose -p frank-portfolio -f docker-compose.yml up -d frank-portfolio
