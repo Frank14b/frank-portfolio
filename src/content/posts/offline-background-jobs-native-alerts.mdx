@@ -1,0 +1,178 @@
+---
+title: "Offline farm jobs and native alerts without a server: idempotent, debounced and deduped"
+summary: "With no backend cron in offline mode, the app itself has to age the animals, open heat windows and remind farmers to log their eggs. Here's how I run those jobs in Electron's main process and in an Expo background task, so they're safe to run any number of times and never nag twice."
+date: "2026-09-24"
+project: "pro-e-farmer"
+tags: ["Electron", "Expo", "Notifications", "Background jobs", "Offline-first", "SQLite"]
+---
+
+In cloud mode, E-Farmer's API has scheduled jobs. Every day they move animal ages forward, re-estimate feed and water, open and close estrus (heat) windows, and push alerts like "no daily report yet" or "this sow is due in heat in 10 days".
+
+In local mode there's no server. The data lives in SQLite on the farmer's phone or computer, so the app has to do that work itself, offline, and raise the alerts as native OS notifications. That sounds simple until you list how it runs: at launch, every hour, when the app comes back to the foreground, after a profile switch, and sometimes twice in a row. Each run has to be harmless, and the farmer has to see each alert once a day at most.
+
+## The flow end to end
+
+<Flow steps={[
+  ["Main process", "FarmJobsService.start(): a first run 4 s after launch, then a check every hour. Sign-in and settings changes call schedule()."],
+  ["Farm jobs", "Skip unless the app is in local mode with a signed-in profile. Skip if this profile's last run in app_meta is under 6 h old."],
+  ["Farm jobs", "In one transaction: recompute ages from acquisition dates, re-estimate feed and water, open or close estrus windows."],
+  ["Alert rules", "collectDueAlerts runs every rule (feed, stock, reports, eggs, heat, end of productive life, crop phases) and removes duplicates by id."],
+  ["Delivery", "Drop alerts already shown today. Show the rest now, or hold the egg and report reminders in a timer until 17:00 or 19:00."],
+  ["Timer fires", "Re-check that the same profile is still signed in, in local mode, with alerts on, and not shown yet today. Then show it."],
+  ["OS click", "Focus the window and send a typed farm-alerts:open event with the farm and the route."],
+  ["Renderer", "Accept only in-app routes, switch to that farm if needed, then navigate."],
+]} />
+
+## 1. Run often, work rarely
+
+The service runs in Electron's **main process**, not in the Angular page. The database already lives there, and notifications are an OS feature. It also means the jobs keep working while the window is minimized or reloading, and the page has no IPC method to trigger or tamper with them.
+
+The scheduling is deliberately dumb. An hourly `setInterval` asks "is it time?", and a timestamp in the `app_meta` table answers:
+
+```ts title="farm-jobs.ts (trimmed)"
+export const FARM_JOBS_DEBOUNCE_MS = 6 * 60 * 60 * 1000;
+export const lastFarmJobsKey = (userId: number) => `lastFarmJobsAt:${userId}`;
+
+export function runFarmJobs(db: Database, userId: number, options: { now?: Date; force?: boolean } = {}) {
+  const now = options.now ?? new Date();
+  const meta = new AppMeta(db);
+  if (!options.force) {
+    const lastAt = meta.get(lastFarmJobsKey(userId));
+    if (lastAt) {
+      const elapsed = now.getTime() - new Date(lastAt).getTime();
+      if (Number.isFinite(elapsed) && elapsed < FARM_JOBS_DEBOUNCE_MS) {
+        return { ran: false, animalsUpdated: 0, identificationsUpdated: 0,
+                 ageGatedAlerts: [], skippedReason: 'debounced' };
+      }
+    }
+  }
+  return transaction(db, () => {
+    const result = updateAges(db, userId, now);
+    meta.set(lastFarmJobsKey(userId), now.toISOString());
+    return result;
+  });
+}
+```
+
+The key carries the profile id. The mobile app has one user per phone, so one `lastFarmJobsAt` was enough there. The desktop app holds several local profiles in one database file, and with a single key, signing in as a second farmer would skip their jobs because the first one ran an hour earlier. Every query is also limited to the farms the signed-in profile belongs to.
+
+`run()` can't overlap with itself (`this.running ??= this.runOnce(...)`), and `schedule()` collapses calls that arrive close together into one. Every function takes `(db, userId, now)`, so the specs drive it with an in-memory SQLite harness and a fixed clock.
+
+## 2. Make the job idempotent by deriving, not incrementing
+
+The tempting implementation is `currentAge = currentAge + 1` once a day. It breaks the first time the job runs twice, or doesn't run for a week because the laptop was closed. So the age is always **derived from dates**:
+
+```ts title="farm-jobs.ts (trimmed)"
+const acquisition = new Date(animal.acquisitionDate ?? animal.createdAt);
+const daysDifference = getDaysUntilToday(acquisition, now);
+const currentAge = (animal.initAge ?? 0) + daysDifference;
+
+const quantityForOne = calculateDailyFoodConsumption({
+  type: animal.type, currentAge, isEstrusDetected: false, isFarrowing: false,
+});
+```
+
+Feed and water estimates, the laying age range of a flock and the end of productive life all follow from that age, using the shared farm-science library. Run it twice on the same day and it writes the same values. A spec checks exactly that.
+
+Estrus windows need one more guard. When a heat is overdue and wasn't detected, the expected heat moves forward by one cycle (21 days for pigs). That bump only happens when the stored age actually **grew** since the last run. Without that check, a second run on the same day would push the window forward again.
+
+<Callout tone="warn">
+Some alerts only exist at the moment the age moves forward ("heat in 12 days" fires as the window opens). The job returns those as `ageGatedAlerts` instead of writing them anywhere, so a debounced run naturally produces none. If you persist them, you'll need your own dedupe for them too.
+</Callout>
+
+## 3. Alert rules, dedupe keys and "where to go"
+
+`collectDueAlerts` ports every rule from the mobile app: missing feed formula, low stock, urgent restock, missing daily report, missing egg collection, heat within 15 days, fewer than 15 days of productive life left, and crop phase changes or phase endings within 2 days. Each group of rules runs inside a `safely()` wrapper, so one broken query logs a warning instead of silencing every other alert.
+
+Every alert gets a stable identifier, `local:{kind}:{id}`, and a target route:
+
+```ts title="farm-alerts.ts (trimmed)"
+for (const animal of missingEggs) {
+  due.push({
+    identifier: localFarmAlertId('missing-eggs', animal.id),  // local:missing-eggs:42
+    kind: 'missing-eggs',
+    vars: { name: animal.name },
+    target: production(animal.businessId, animal.id, 'eggs'), // /livestock/42/eggs
+  });
+}
+```
+
+The identifier is the dedupe key. The service stores `{ identifier: localDay }` in `app_meta` under `localFarmAlertDedupe:<profileId>`, and when it loads that map it throws away every entry that isn't today. An alert is marked as shown only when the OS actually accepted it, so if `Notification.isSupported()` is false or the call fails, the next run tries again.
+
+## 4. Electron can't schedule a notification for later
+
+On mobile, `expo-notifications` hands the OS a notification with a date trigger, and the OS delivers it at 17:00 even if the app has been killed. Electron's `Notification` has no such thing: `show()` means now.
+
+The egg reminder should arrive at 17:00 and the daily report reminder at 19:00, when it's fair to say they're missing. So the service holds those as timers:
+
+```ts title="farm-jobs.service.ts (trimmed)"
+const delay = alertDelayMs(alert.kind, now);   // ms until 17:00 / 19:00, or 0
+if (delay > 0) {
+  this.timers.set(key, setTimeout(() => {
+    this.timers.delete(key);
+    void this.showLater(userId, alert);
+  }, delay));
+} else if (this.show(alert, language, shownToday, today)) {
+  alertsShown += 1;
+}
+```
+
+A timer can fire hours after it was set, and a lot can change in between. So `showLater` doesn't trust the state it captured. It reloads the settings, returns early unless the app is still in local mode with alerts on and the **same profile** still signed in, and checks today's dedupe map again before it shows anything. Each run also cancels timers that belong to another profile and drops waiting alerts that are no longer in the due list.
+
+Translations are a small table in the main process (9 alert kinds, English and French, mostly copied from the mobile app's locale files), not a round-trip to the renderer. Alerts have to work while the page is hidden or reloading.
+
+## 5. The click: a typed event and a route whitelist
+
+Clicking a notification restores and focuses the window, then sends a typed main-to-renderer event. The preload forwards only the payload, never the IPC event object. On the Angular side, a service created at startup does the rest:
+
+```ts title="farm-alert-navigator.ts (trimmed)"
+const isAppRoute = (url: string) => /^\/(?!\/)[\w\-/?=&.]*$/.test(url);
+
+async open(target: FarmAlertTarget): Promise<boolean> {
+  if (!isAppRoute(target.url) || !this.session.user()) return false;
+  if (this.session.business()?.id !== target.businessId) {
+    try { await this.businesses.switchTo(target.businessId); }
+    catch { return false; } // the farm was deleted since the alert was shown
+  }
+  return this.router.navigateByUrl(target.url);
+}
+```
+
+The main process builds those URLs itself, but the renderer still accepts only paths that start with a single `/`, never `//host` or `https:`. A notification click shouldn't be a way to navigate anywhere else.
+
+One small detail: the notifier keeps each `Notification` in a `Set` until it's clicked or closed. On some platforms, a notification object that gets garbage-collected silently loses its click handler.
+
+## 6. The mobile side: `expo-background-task`
+
+The Expo app runs the same jobs from a hook when the app starts or comes back to the foreground, and also registers a background task so the work happens even if the farmer doesn't open the app:
+
+```ts title="backgroundFarmJobs.task.ts (trimmed)"
+TaskManager.defineTask(BACKGROUND_FARM_JOBS_TASK, async () => {
+  try {
+    if (AppState.currentState === 'active') return BackgroundTask.BackgroundTaskResult.Success;
+    if (!isUiDbReady()) return BackgroundTask.BackgroundTaskResult.Success;
+    if ((await getStorageMode()) !== 'local') return BackgroundTask.BackgroundTaskResult.Success;
+    await runLocalFarmJobs();
+    return BackgroundTask.BackgroundTaskResult.Success;
+  } catch {
+    return BackgroundTask.BackgroundTaskResult.Failed;
+  }
+});
+
+await BackgroundTask.registerTaskAsync(BACKGROUND_FARM_JOBS_TASK, { minimumInterval: 60 * 24 });
+```
+
+Three guards matter. **Skip while active**, because the foreground hook already handles that case, and jobs racing the app's own database work had already caused `SQLITE_BUSY` errors. **Wait for the DB-ready latch**: `markUiDbReady()` is only called once activating a local session has completed a real write, and `runLocalFarmJobs` waits up to 20 seconds for it before giving up. The background path just returns, so the OS doesn't count it as a failure. **Accept the OS's schedule**: the 24-hour minimum interval is a floor, not a promise, which is why the 6-hour debounce and date-derived ages matter. The job has to produce the right state whenever it happens to run.
+
+<Callout tone="tip">
+Design offline jobs as "bring state up to date as of now", not "do today's step". Derive from dates, debounce with a stored timestamp, dedupe alerts with stable keys and a day stamp. Then it doesn't matter whether the scheduler fires hourly, daily or twice in a row.
+</Callout>
+
+## What I'd tell you before you build one
+
+- **Key everything by user.** Debounce stamps and dedupe maps that were fine on a one-user phone broke as soon as one desktop file held several profiles.
+- **Inject the clock.** Passing `now` into every function made the 17:00 timing, the 6-hour debounce and the once-a-day rule testable with fake timers instead of waiting for real time.
+- **Re-check state when a delayed action fires.** Profile, mode and setting can all change between scheduling and firing.
+- **Mark alerts as shown only after the OS confirms it.** Otherwise one failure is a silently lost reminder.
+- **What I'd change:** a 17:00 timer re-checks the session but not the rule itself. If a farmer logs eggs at 15:00, the reminder is only dropped if another full run happens before 17:00, and the 6-hour debounce makes that unlikely. Re-running that one rule's query inside `showLater` would close the gap. The desktop app also has no background task when it's closed; it checks at launch and hourly while open.
+- **Measure the background path.** On mobile, the DB-ready latch is a module-level flag, so it starts out false in any fresh JS process. I want real numbers on how often a cold background run does work instead of returning early, rather than assuming the 24-hour task always fires the jobs.

@@ -1,0 +1,181 @@
+---
+title: "P2P-first 1:1 calls that fall back to an SFU mid-call without hanging up"
+summary: "Peer-to-peer WebRTC is cheap and private until a carrier NAT breaks it, and an SFU always connects but costs server bandwidth on every call. Here's how MboaMeet starts calls P2P with Coturn, and switches both phones to a self-hosted LiveKit room on the same call id when ICE fails."
+date: "2026-07-30"
+project: "mboameet"
+tags: ["WebRTC", "React Native", "SignalR", "LiveKit", "Coturn", "ASP.NET Core"]
+---
+
+MboaMeet's 1:1 calls have to work for people on mobile data, where a lot of traffic sits behind carrier-grade NAT and bandwidth costs real money. That pulls in two directions.
+
+A **peer-to-peer** call sends media straight between the two phones. It costs the server nothing beyond signaling, and it has the lowest latency when it connects. But some networks never let two peers reach each other, even with a TURN relay. An **SFU** (here, a self-hosted LiveKit server) connects almost always, but every byte of every call flows through my VPS.
+
+I didn't want to pick one. Calls start P2P by default, and when the peer connection reports `failed`, both phones move to a LiveKit room **without ending the call**: same call id, same call screen, same call log entry.
+
+## The flow end to end
+
+<Flow steps={[
+  ["Caller app", "Fetches ICE servers (Coturn STUN/TURN with time-limited credentials), creates an RTCPeerConnection, then invokes StartCall with transport p2p."],
+  ["SignalR hub", "Validates the call (blocks, live hosts, busy users, stale sessions), stores an in-memory session and rings the callee by push."],
+  ["Callee app", "Opens media and its own peer connection, then invokes AcceptCall. The hub broadcasts CallAccepted to both participants."],
+  ["Caller app", "Adds local tracks and creates the offer. SDP and ICE candidates are relayed by the hub only to the other participant."],
+  ["Both apps", "Buffer ICE candidates in both directions until the call id exists and the remote description is applied."],
+  ["Either app", "If connectionState becomes failed, invokes RequestLiveKitFallback. The hub flips the session to livekit and broadcasts CallMediaTransport."],
+  ["Both apps", "Tear down the peer connection and local tracks, keep the call id, and join the LiveKit room call-{callId}."],
+]} />
+
+## 1. Short-lived TURN credentials
+
+TURN is what makes P2P work on most restrictive networks: when a direct path fails, both peers relay through the TURN server. Coturn supports the **TURN REST API** convention, so I never store per-user TURN passwords. The API mints a credential on request: the username is `expiry:userId`, and the password is an HMAC-SHA1 of that username, keyed with a secret that only the API and Coturn know. Coturn recomputes the HMAC and rejects the credential once the expiry has passed.
+
+```csharp title="CoturnIceServerService.cs (trimmed)"
+var ttl = Math.Clamp(_opt.CredentialTtlSeconds, 300, 604800);   // 5 min .. 7 days
+var expiryUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds() + ttl;
+var username = $"{expiryUnix}:{userId}";
+var credential = ComputeTurnRestCredential(username, _opt.AuthSecret);
+
+return new
+{
+    iceServers = new object[]
+    {
+        new { urls = $"stun:{host}:{stunPort}" },
+        new { urls = new[] { $"turn:{host}:{turnPort}?transport=udp",
+                             $"turn:{host}:{turnPort}?transport=tcp",
+                             $"turns:{host}:{turnsPort}?transport=tcp" },
+              username, credential },
+    },
+    ttl,
+};
+
+internal static string ComputeTurnRestCredential(string username, string secret)
+{
+    Span<byte> hash = stackalloc byte[20];
+    HMACSHA1.HashData(Encoding.UTF8.GetBytes(secret), Encoding.UTF8.GetBytes(username), hash);
+    return Convert.ToBase64String(hash);
+}
+```
+
+The TTL is clamped so a bad config value can't produce a credential that's already expired or one that lives for months. Offering TURN over UDP, TCP and TLS matters on mobile networks: some block UDP entirely, and TLS gets through networks that only allow web traffic.
+
+The ICE endpoint takes the planned transport as a query parameter. A call that will use LiveKit gets public STUN only, since the SFU does its own relaying, so TURN credentials are only issued for calls that actually go P2P.
+
+## 2. Signaling on the same SignalR hub as chat
+
+The app already holds a SignalR connection for chat, so call signaling lives on the same hub. `StartCall` does the validation that's easy to get wrong on the client:
+
+```csharp title="AppHub.cs (trimmed)"
+if (await _userBlockService.EitherBlocksOtherAsync(callerId, calleeUserId))
+    throw new HubException("You cannot call this user.");
+if (await _liveSessionsService.HasActiveHostedLiveAsync(calleeUserId))
+    throw new HubException("This user is currently live and cannot receive calls.");
+
+// Auto-end any previous call the caller started before placing a new one.
+CallSession? staleCaller = _callSignaling.GetCallerSession(callerId);
+if (staleCaller is not null && _callSignaling.TryRemoveCall(staleCaller.CallId))
+    { /* record ended, send CallEnded to both participants */ }
+
+if (_callSignaling.IsUserInCall(calleeUserId))
+    throw new HubException("This user is already on another call. Please try again later.");
+if (_callSignaling.IsUserInCall(callerId))
+    throw new HubException("You are already on another call. Please end it before starting a new one.");
+
+Guid callId = _callSignaling.CreateCall(callerId, calleeUserId, mode, clientMediaTransport);
+```
+
+The stale-session auto-end exists because real users do things tests don't: the app crashes mid-ring, the user force-quits and calls again. Without it, the caller would be "already on another call" with a call they can't see. "Busy" is also deliberately forgiving: an active call always blocks, but a ringing session only blocks for its first minute, so a missed push can't make someone unreachable.
+
+`AcceptCall` only succeeds for the callee of a session that is still `Ringing`, so duplicate accepts (a remount, a retry after a dropped socket) fail cleanly, and the app treats that specific error as "already accepted". After that, the hub is a plain relay. Offers, answers and ICE candidates go through methods that check the sender is a participant, then one helper that forwards only to the other participant:
+
+```csharp title="AppHub.cs (trimmed)"
+private async Task RelayToPeerAsync(Guid callId, int senderUserId, string eventName, object payload)
+{
+    int? peer = _callSignaling.GetOtherParticipant(callId, senderUserId);
+    if (peer is null) return;
+    List<string> connections = await _appRedisCacheAdapter.GetUserConnections(peer.Value);
+    if (connections.Count > 0)
+        await Clients.Clients(connections).SendAsync(eventName, payload);
+}
+```
+
+## 3. Buffer ICE candidates in both directions
+
+Trickle ICE produces candidates as soon as a peer connection starts gathering, and the network doesn't care whether your app is ready. In `hooks/useWebRtcCall.ts` there are two separate races:
+
+- **Outbound.** The caller creates its peer connection *before* `StartCall` returns, so candidates can exist before there is a call id to attach them to. They queue in `pendingIceJsonRef` and are flushed once the id arrives and the hub is connected.
+- **Inbound.** Candidates from the other side can arrive before `setRemoteDescription` has run, and `addIceCandidate` throws in that state. They queue in `pendingRemoteIceRef` and are applied right after the offer or answer is set.
+
+```ts title="useWebRtcCall.ts (trimmed)"
+const onIce = async (payload) => {
+  if (callTransportRef.current === 'livekit') return;
+  const init = parseCandidate(payload.candidateJson);
+  const pc = pcRef.current;
+  // Adding candidates before the remote description throws and drops connectivity
+  // on restrictive networks. Flushed in onOffer / onAnswer.
+  if (!pc || !remoteDescriptionSetRef.current) {
+    pendingRemoteIceRef.current.push(init);
+    return;
+  }
+  await pc.addIceCandidate(new RTCIceCandidate(init));
+};
+```
+
+The caller also doesn't open the camera or microphone until `CallAccepted` arrives. Only then does it add its tracks and create the offer, so a call that's never answered never turns the camera light on.
+
+<Callout tone="warn">
+Dropped early candidates rarely break a call on office Wi-Fi, where the first host candidate usually works. They break it on mobile networks, where the relay candidate that would have saved you was in the batch you lost. Test signaling on a throttled cellular connection, not on your desk.
+</Callout>
+
+## 4. Fall back to the SFU on the same call id
+
+The interesting part is what happens when P2P fails after the call is already up. Either side can drive the switch:
+
+```ts title="useWebRtcCall.ts (trimmed)"
+pc.addEventListener('connectionstatechange', () => {
+  if (pc.connectionState === 'connected') return markMediaConnected();
+  if (pc.connectionState !== 'failed' || callTransportRef.current === 'livekit') return;
+  void tryLiveKitFallbackRef.current();   // caller; the callee runs handleCalleeP2pFailure
+});
+
+const tryLiveKitFallback = async () => {
+  if (livekitFallbackTriedRef.current) return false;
+  livekitFallbackTriedRef.current = true;
+  try { await connection.invoke(hubConstants.calls.requestLiveKitFallback, callId); }
+  catch { livekitFallbackTriedRef.current = false; return false; }
+  releaseP2pForLiveKit();          // close the PC, stop tracks, keep the call id
+  setCallTransport('livekit');
+  return true;
+};
+```
+
+On the server, `TrySwitchToLiveKit` accepts the request from either participant of an `Active` call and flips the session's `MediaTransport`. If the session is already on `livekit` it just returns true, which keeps the operation idempotent when both phones detect the failure at the same moment. The hub then broadcasts `CallMediaTransport` to both participants. Whichever phone didn't ask receives the event and runs the same `releaseP2pForLiveKit()`. Both then render the LiveKit call component, which joins the room `call-{callId}`.
+
+Because the call id never changes, nothing above the transport layer notices: the call screen stays mounted, the timer keeps running, and the call log records one call.
+
+The callee has one extra safeguard. If its own fallback request fails (for example, because its hub invoke was the thing that broke), it starts a **12-second grace timer** and waits for the caller-driven `CallMediaTransport`. Only if that never arrives does it show "The call could not be connected." Failed offers or answers take the same fallback path, and each call attempts the fallback only once.
+
+Users can also skip P2P on purpose. Each DM has a "server relay" toggle, stored on the device per chat and defaulting to P2P. With it on, `StartCall` is sent with `livekit` and no peer connection is ever created.
+
+## 5. Clean up what crashes leave behind
+
+Sessions live in memory, and pushes get lost. `StaleCallSessionCleanupService` is a `BackgroundService` that runs every minute and evicts ringing sessions older than two minutes. `IsUserInCall` already ignores ringing sessions older than a minute, so the sweep is about memory and tidiness rather than correctness.
+
+## The single-node trade-off
+
+This design runs on one API node, and I chose that knowingly:
+
+- `CallSignalingService` is a singleton over a `ConcurrentDictionary`. Restart the process and in-flight call sessions are gone.
+- User-to-connection mappings live in Redis, but SignalR has no backplane, so `Clients.Clients(ids)` can only reach connections on the local process.
+
+For the current traffic, that's the right amount of infrastructure. Scaling out would take three changes: the SignalR Redis backplane so any node can reach any connection, call sessions moved into Redis with a TTL (with the accept and fallback transitions done atomically, for example in a Lua script), and the stale-session sweep replaced by key expiry. The hub methods themselves wouldn't need to change.
+
+## From mesh to SFU for lives
+
+Lives taught me the same lesson earlier. The first version used the hub for a **mesh**: the host's phone held one peer connection per viewer, so its upload bandwidth grew linearly with the audience, and a phone on mobile data hits that ceiling after a handful of viewers. Lives now run in LiveKit rooms (`live-{id}`, with up to three co-hosts), and the old mesh methods still sit on the hub, though the current app no longer calls them. For 1:1 calls, P2P is still the right default: exactly two peers, no fan-out, and no server bandwidth when it works.
+
+## What I'd tell you before you build one
+
+- **Make the fallback a transport swap, not a new call.** Keeping the call id stable is what made the switch invisible to the call screen, the timer and the call log.
+- **Let either side request the switch, and make it idempotent.** Both peers often see `failed` at nearly the same time.
+- **Buffer ICE both ways from day one.** It's a few lines of code and it removes a class of "works on Wi-Fi" bugs.
+- **Mint TURN credentials per request, with a clamped TTL.** Long-lived TURN passwords tend to end up shipped inside app bundles.
+- **Write down your single-node assumptions.** In-memory sessions and no backplane are fine choices, as long as the path to Redis is planned before you need a second node.

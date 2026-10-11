@@ -1,0 +1,192 @@
+---
+title: "A payment webhook inbox that can't double-credit: RevenueCat, Stripe top-ups and an AI billing saga"
+summary: "Payment providers retry webhooks, deliver them out of order and sometimes send the same event twice, and every one of those cases can turn into free tokens or a lost purchase. Here's the inbox pattern I use in MboaMeet: store the raw event under a unique id, process it later from a background worker, and make every credit and refund idempotent by reference."
+date: "2026-09-05"
+project: "mboameet"
+tags: ["ASP.NET Core", "PostgreSQL", "Payments", "Webhooks", "Idempotency", "RevenueCat"]
+---
+
+MboaMeet sells two things through the app stores: subscriptions (premium plans) and token packs that top up an in-app wallet. Both go through RevenueCat, which tells my API about purchases, renewals, expirations and transfers with webhooks. Tokens are also sold through Stripe on the web, and they're spent on things like the AI Studio, which generates images and music.
+
+Webhooks look simple: receive a POST, update the database. In practice:
+
+- The provider retries when your endpoint is slow or returns a 5xx, so the same event arrives twice.
+- Events can arrive out of order. A `RENEWAL` processed before the `INITIAL_PURCHASE` it follows is a real possibility.
+- If your processing code throws halfway, the provider retries, and you'd better not credit the wallet a second time.
+
+So I split receiving from processing. The endpoint does one thing: store the raw event under a unique key. A background worker processes stored events later, and every side effect is keyed on something stable so running it twice changes nothing.
+
+## The flow end to end
+
+<Flow steps={[
+  ["RevenueCat", "POSTs an event (INITIAL_PURCHASE, RENEWAL, EXPIRATION, TRANSFER, …) with a unique event.id."],
+  ["Webhook endpoint", "Reads the raw body, extracts a few index columns and inserts one row. No business logic."],
+  ["Postgres", "A unique index on EventId turns a redelivery into error 23505. The endpoint answers 200 duplicate."],
+  ["Background service", "Every minute: takes up to 50 unprocessed rows with fewer than 15 attempts, oldest first."],
+  ["Processor", "Subscriptions: re-reads the subscriber from the RevenueCat REST API and applies that state. Token packs: credits the wallet."],
+  ["Wallet", "Credits are keyed on a ProviderReference like revenuecat:event:{id}. If the reference exists, the credit is skipped."],
+  ["Processor", "Marks the row processed, or stores LastError and leaves it for the next tick."],
+]} />
+
+## 1. The endpoint only stores
+
+The controller reads the body as a string, pulls out the fields I want to index for support and debugging, and saves the whole payload:
+
+```csharp title="RevenueCatWebhookController.cs (trimmed)"
+string raw = await new StreamReader(Request.Body).ReadToEndAsync(cancellationToken);
+using JsonDocument doc = JsonDocument.Parse(raw);
+if (!TryGetPropertyIgnoreCase(doc.RootElement, "event", out JsonElement ev)) return BadRequest("missing event");
+string? eventId = GetStringIgnoreCase(ev, "id");
+if (string.IsNullOrWhiteSpace(eventId)) return BadRequest("missing event.id");
+
+_context.RevenueCatWebhookEvents.Add(new RevenueCatWebhookEvent
+{
+    EventId = eventId.Trim(),
+    EventType = Truncate(GetStringIgnoreCase(ev, "type") ?? "", 80),
+    AppUserId = Truncate(appUser, 256),
+    RawBody = raw,
+    ReceivedAtUtc = DateTime.UtcNow,
+});
+try { await _context.SaveChangesAsync(cancellationToken); }
+catch (DbUpdateException ex) when (ex.InnerException is PostgresException { SqlState: PostgresErrorCodes.UniqueViolation })
+{
+    return Ok(new { duplicate = true });
+}
+return Ok(new { accepted = true });
+```
+
+The entity has a unique index on `EventId`. That makes the database the dedupe mechanism: no "check if it exists, then insert" race, no cache. A redelivered event hits Postgres error `23505` (`unique_violation`), and the endpoint returns **200**, not 409. From the provider's point of view, the event was delivered; a non-2xx would just trigger more retries.
+
+Keeping business logic out of the endpoint matters as much as the dedupe. The response time is one insert, so the provider never times out and retries because my subscription code was waiting on a slow downstream call. And because the raw body is stored, I can replay any event after fixing a bug, which has been more useful than any log line.
+
+## 2. Process from a background worker, with an attempt cap
+
+The worker started life as a Hangfire recurring job. It's now a plain `BackgroundService` that ticks every minute, with a `SemaphoreSlim` so a slow batch can't overlap with the next tick:
+
+```csharp title="ProcessRevenueCatWebhookEventsJob.cs (trimmed)"
+private const int MaxAttempts = 15;
+private const int BatchSize = 50;
+
+List<RevenueCatWebhookEvent> batch = await db.RevenueCatWebhookEvents
+    .Where(e => e.ProcessedAtUtc == null && e.ProcessingAttempts < MaxAttempts)
+    .OrderBy(e => e.Id)
+    .Take(BatchSize)
+    .ToListAsync();
+
+foreach (RevenueCatWebhookEvent row in batch)
+{
+    row.ProcessingAttempts++;
+    try
+    {
+        await processor.ProcessStoredWebhookAsync(row, CancellationToken.None);
+        row.ProcessedAtUtc = DateTime.UtcNow;
+        row.LastError = null;
+    }
+    catch (Exception ex)
+    {
+        row.LastError = ex.Message.Length > 2000 ? ex.Message[..2000] : ex.Message;
+        if (row.ProcessingAttempts >= MaxAttempts) row.ProcessedAtUtc = DateTime.UtcNow;
+    }
+    await db.SaveChangesAsync();
+}
+```
+
+Three choices are worth calling out:
+
+- **Each row saves on its own.** One poisoned event doesn't roll back the rest of the batch.
+- **`LastError` lives on the row.** When a user writes in about a missing purchase, the first query is "show me their events and their errors". There's no log search needed.
+- **The attempt cap parks bad events.** After 15 failures (at least 15 minutes of one-minute ticks), the row is closed with its error kept, so it stops consuming every tick. The admin panel lists events with their attempts and errors, and requeuing one resets its attempts and error so the next tick picks it up again.
+
+## 3. Don't trust payload order: re-sync from the source
+
+The tempting implementation applies each subscription event's fields directly: `RENEWAL` says the new expiry is X, so write X. That works until events arrive out of order, and then an older event overwrites a newer state.
+
+For subscription events, the processor ignores the payload's state and asks RevenueCat for the subscriber's *current* state instead:
+
+```csharp title="RevenueCatPurchaseProcessor.cs (trimmed)"
+if (SubscriptionSyncEventTypes.Contains(eventType ?? ""))   // INITIAL_PURCHASE, RENEWAL, PRODUCT_CHANGE, …
+{
+    RevenueCatSyncResponseDto sync = await SyncUserFromRevenueCatApiAsync(userId, cancellationToken);
+    return;
+}
+
+// SyncUserFromRevenueCatApiAsync: GET v1/subscribers/{appUserId}, then for each subscription
+// mapped to a platform plan, keep the one with the latest future expires_date.
+if (current is not null && current.PlanId == bestPlanId && current.ExpiresAt >= bestExp.AddMinutes(-5))
+    return (true, false, "Already synchronized");
+await _platformSubscriptionService.AssignSubscriptionAsync(userId, bestPlanId.Value,
+    autoRenew: true, startsAtUtc: null, expiresAtUtc: bestExp, purchaseStore: bestStore);
+```
+
+The event becomes a *notification that something changed*, not the source of truth. Processing the same event twice, or two events in the wrong order, converges on the same answer, because each run reads the latest state. The "already synchronized" check turns repeats into no-ops instead of rewriting the subscription row each time. The same sync method backs an endpoint the app calls to re-sync a user's subscription on demand, so there's one code path that decides what plan a user has.
+
+Two event types get specific handling. `EXPIRATION` deactivates the user's active platform subscription for that product. `TRANSFER` (entitlements moving between app user ids) deactivates the source users and assigns the plan to the destination, falling back to a REST re-sync whenever the payload is missing the plan or expiry.
+
+<Callout tone="tip">
+A webhook tells you *that* something happened. When the provider has an API that tells you *what's true now*, use the webhook as a trigger and read the state. You trade one HTTP call per event for not having to reason about ordering at all.
+</Callout>
+
+## 4. Credits keyed on a reference that can only exist once
+
+Token packs are consumable purchases, so there's no "current state" to re-read. Each purchase event has to credit the wallet exactly once. The processor builds a reference from the RevenueCat event id and passes it to the wallet use case:
+
+```csharp title="RechargeWalletUseCase.cs (trimmed)"
+// called with uniqueProviderReference = $"revenuecat:event:{eventId}"
+string reference = uniqueProviderReference.Trim();
+if (await _context.WalletRechargeTransactions.AnyAsync(t => t.ProviderReference == reference, ct))
+    return false;                                   // already credited
+
+var tx = new WalletRechargeTransaction
+{
+    UserId = userId, WalletId = wallet.Id, Tokens = tokens,
+    Status = BillingTransactionStatus.Paid, ProviderReference = reference, PaymentMethod = "revenuecat",
+};
+_context.WalletRechargeTransactions.Add(tx);
+await _context.SaveChangesAsync(ct);
+await CreditWalletAndRecordLedgerAsync(tx, ct);     // balance += tokens, plus a ledger row
+```
+
+The inbox already dedupes by event id, so why dedupe again? Because the two protect against different failures. The unique index stops a *redelivered* event from creating a second row. The reference check stops a *reprocessed* row from crediting twice: for example, if the credit committed but the worker crashed before it marked the row processed, the next tick runs the same event again and finds the reference already there. The existence check is safe here because the inbox worker is the only writer for these references and it processes rows one at a time.
+
+Each credit also writes a `WalletBalanceTransaction` ledger row with before and after balances and the same reference. When a balance looks wrong, the ledger explains it line by line.
+
+Stripe top-ups use the same idea with a different key. A top-up creates a pending `WalletRechargeTransaction` with a generated reference, and that reference travels in the PaymentIntent's metadata. When the app confirms, the API retrieves the PaymentIntent from Stripe, requires status `succeeded`, finds the transaction by that reference or by the intent id, and credits only on the transition from `Pending` to `Paid`. A second confirm for the same intent finds the transaction already paid and just returns the current balance.
+
+## 5. The AI Studio billing saga
+
+Spending tokens has the opposite problem. The AI Studio calls an external AI service that can be slow, unavailable or fail mid-generation, and a user who paid for a failed generation should get the tokens back. There's no distributed transaction across my database and someone else's model, so it's a small saga with a compensating step:
+
+```csharp title="GenerateStudioMusicUseCase.cs (trimmed)"
+var billing = await _studioAiBillingService.EvaluateMusicAccessAsync(userId, durationSeconds, ct);
+if (!billing.Allowed) return StudioAiOperationResult.FromBillingDecision(billing);   // insufficient tokens
+
+var record = new StudioMusicRequest { UserId = userId, Status = "processing", WasFreeTier = billing.IsFreeTier };
+_dataContext.StudioMusicRequests.Add(record);
+await _dataContext.SaveChangesAsync(ct);                        // 1. durable request row
+
+if (billing.TokensCharged > 0)
+{
+    await _studioAiBillingService.DebitForMusicRequestAsync(userId, record.Id, billing.TokensCharged, ct);
+    record.TokensCharged = billing.TokensCharged;               // 2. debit, ref studio_music:{id}:debit
+    await _dataContext.SaveChangesAsync(ct);
+}
+
+var (body, statusCode) = await _aiMusicClient.GenerateTrackJsonAsync(requestJson, ct);  // 3. call the AI
+if (body is null || statusCode < 200 || statusCode >= 300)
+{
+    await FailAndMaybeRefundAsync(userId, record, error, ct);   // 4. mark failed, refund
+    return /* error result */;
+}
+```
+
+The free tier comes first: each feature has a daily allowance per UTC day (5 image edits, 2 music tracks), counted from the request rows created that day. Past the allowance, a request costs tokens (5 for an image edit, 5 for a music clip up to 30 seconds, 15 for a full song), and access is denied up front if the balance is short.
+
+The debit runs in its own database transaction. It re-checks the balance inside that transaction, decrements it, and writes a ledger row with the reference `studio_music:{id}:debit`. The refund mirrors it with `studio_music:{id}:refund` and checks that reference first, so calling it twice refunds once. The request row is created *before* any money moves, which means every debit and refund points at a durable record of what was attempted.
+
+## What I'd tell you before you build one
+
+- **Make the endpoint boring.** Validate the shape, insert the raw body, return 200. Everything interesting happens where you can retry it.
+- **Let the database dedupe.** A unique index plus "unique violation means 200" is simpler and more correct than any lookup-then-insert in application code.
+- **Re-read state instead of trusting event order** whenever the provider gives you an API for it.
+- **Give every money movement a deterministic reference**, and write a ledger row for it. Idempotency and auditability come from the same column.
+- **What I'd change in the saga:** two gaps are worth closing. Free-tier usage is counted from request rows, so a free generation that failed still uses up one of the day's free attempts. Counting only completed (or non-refunded) rows would be fairer. And if the process dies between the debit and the AI call, the request stays in `processing` with tokens charged. A small sweeper that fails and refunds requests stuck in `processing` for more than a few minutes would close it, and the reference-checked refund is already idempotent, so the sweeper can't double-refund.

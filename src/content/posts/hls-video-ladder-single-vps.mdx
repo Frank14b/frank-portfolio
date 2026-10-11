@@ -1,0 +1,164 @@
+---
+title: "An HLS video ladder on a single VPS: H.264 + HEVC tiers, aligned keyframes and Nginx doing the serving"
+summary: "A scrolling video feed needs fast starts and small files, and a CDN-backed media pipeline is a lot of infrastructure for an early product. Here's the pipeline I built for MboaMeet's feed: client-side compression, a Hangfire + FFmpeg ladder with three tiers in two codecs, and Nginx serving the segments straight from disk."
+date: "2026-08-22"
+project: "mboameet"
+tags: ["FFmpeg", "HLS", "Video", "Hangfire", "Nginx", "React Native"]
+---
+
+The MboaMeet feed is a vertical video feed: you scroll, the next clip plays. The first version served each post's MP4 through an authenticated range-request endpoint on the API. That worked, but every byte of video went through Kestrel, a phone on mobile data downloaded the clip at upload quality, and an MP4 with its `moov` atom at the end can't start playing until the player has found it.
+
+I didn't want a managed video service or a CDN contract for an early product. The goal was simpler: **turn every upload into a small HLS ladder on the same VPS, and let Nginx serve it from disk**, so the API never touches video bytes during playback.
+
+## The flow end to end
+
+<Flow steps={[
+  ["Mobile app", "Remuxes the clip to MP4 and compresses it on-device: long edge capped, bitrate scaled down with duration."],
+  ["Mobile app", "Uploads it as multipart form data with the post. The API stores the file and marks the feed file HLS pending."],
+  ["Hangfire", "One job renders a blurred poster. The Normal job does a faststart remux, probes dimensions, and encodes the 720p tier in H.264 and HEVC."],
+  ["Hangfire", "Marks Normal ready, then queues Data Saver (360p) and Eco (480p) as separate jobs. Each one rewrites the master playlist."],
+  ["API", "Publishes the post once Normal and Eco are both ready, and notifies the author that it's live."],
+  ["Nginx", "Serves playlists and fMP4 segments with sendfile: segments cached as immutable, playlists with a short max-age."],
+  ["Mobile app", "Picks a tier from the network type (Wi-Fi: best, cellular: eco), keeps one active player, and prewarms the next video."],
+]} />
+
+## 1. Compress on the phone first
+
+The cheapest transcode is the one the server never has to do. Before upload, `prepareFeedLikeVideoForUpload` normalizes the clip to MP4 (remuxing MOV and copying `content://` or `ph://` URIs into the cache), then compresses it with `react-native-compressor` in manual mode.
+
+```ts title="constants/feedVideoUpload.ts (trimmed)"
+/** 720p portrait upload cap — max(w,h) = 1280 → 720×1280 at 9:16 (backend Normal tier). */
+export const FEED_UPLOAD_VIDEO_MAX_LONG_EDGE = 1280;
+export const FEED_MAX_VIDEO_DURATION_SEC = 5 * 60;
+export const FEED_UPLOAD_VIDEO_PEAK_BITRATE_BPS = 6_000_000;
+export const FEED_UPLOAD_VIDEO_TARGET_AVG_BITRATE_BPS = 4_000_000;
+
+/** Linear: peak at 0 s → target avg at maxDurationSec (longer clips get a lower bitrate). */
+function scaleUploadBitrateBps(durationSec, maxDurationSec, peakBps, targetAvgBps) {
+  const t = Math.max(0, Math.min(durationSec, maxDurationSec)) / maxDurationSec;
+  return Math.round(peakBps - (peakBps - targetAvgBps) * t);
+}
+```
+
+The upload is a mezzanine file, not the playback file. It only has to be clean enough for the server to encode from, so it's capped at the top tier's resolution, and a 5-minute clip goes up at 4 Mbps instead of whatever the camera recorded. Scaling bitrate by duration keeps short clips sharp and long ones uploadable on a weak connection.
+
+## 2. Remux for faststart, then encode the tier people see first
+
+On the server, `CreateFeedV2UseCase` stores the upload, queues the blurred poster job, and queues the HLS job. The job starts with a cheap step that pays for itself on every legacy MP4 path: a stream-copy remux with `-movflags +faststart`, which moves the `moov` atom to the front of the file. If the audio stream won't copy, it retries without audio rather than failing the post.
+
+Then it encodes the **Normal** tier first and marks it ready immediately, before the cheaper tiers:
+
+```csharp title="FeedVideoHlsQueue.cs (trimmed)"
+await _faststartService.TryRemuxFaststartInPlaceAsync(inputPath);
+await _feedMediaDimensionsService.TryPopulateFromFeedFileAsync(feedFileId);
+await _hlsService.ConvertToHlsAsync(inputPath, outputDir);      // 720p, H.264 + HEVC
+
+feedFile.HlsPlaylistUrl = FeedHlsPaths.PlaylistRelative(feedFileId);
+feedFile.HlsStatus = FeedHlsStatuses.Ready;
+await _context.SaveChangesAsync();
+
+_dataSaverHlsQueue.EnqueuePackage(feedFileId, userId, sourceRelativeUrl);   // 360p
+_ecoHlsQueue.EnqueuePackage(feedFileId, userId, sourceRelativeUrl);         // 480p
+```
+
+Splitting the ladder into separate Hangfire jobs has three effects. A failure in one tier doesn't throw away the others. Retries are per tier. And other uploads' jobs can run in between, instead of one 5-minute clip holding a worker for its entire ladder. The post itself goes live, and the author gets a "your post is live" notification, once Normal and Eco are both ready. If Normal fails but Eco succeeds, playback falls back to Eco.
+
+## 3. The ladder: three tiers, two codecs
+
+Each tier is portrait and **downscale-only**: the scale filter caps each dimension with `min(iw, W)`, so a 480p source on the 720p tier keeps its native size instead of being upscaled into a bigger, blurrier file.
+
+| Tier | Canvas | H.264 cap | HEVC cap | Audio |
+|------|--------|-----------|----------|-------|
+| Data Saver | 360×640 | 380 kbps | 380 kbps | 64 kbps mono AAC |
+| Eco | 480×854 | 580 kbps | 520 kbps | 64 kbps mono AAC |
+| Normal | 720×1280 | 2,200 kbps | 1,900 kbps | 128 kbps AAC |
+
+CRF drives quality and the caps only stop bloat. Two rules adapt to the source: uploads up to 50 MB get a sharper Normal encode (lower CRF, higher cap), and Eco sources up to 12 MB are size-targeted to about 6 MB so a small clip isn't over-compressed.
+
+Every tier is encoded twice: H.264 for universal decode, and HEVC (`-tag:v hvc1`, which Apple players require) for smaller files at the same look. A per-tier "codec master" lists both renditions at the same resolution, HEVC first. If `libx265` is missing on the host, or the HEVC encode fails, the tier ships H.264-only rather than failing.
+
+## 4. Keyframes that line up with segments
+
+HLS segments can only start on a keyframe. If the encoder puts keyframes wherever it likes, segments come out uneven, and switching between tiers mid-stream lands on frames that don't line up. So every rendition uses the same fixed GOP:
+
+```csharp title="FeedHlsLowTierEncodeHelper.cs (trimmed)"
+// FeedHlsAbrConstants: SegmentSeconds = 2, Fps = 30, GopFrames = Fps * SegmentSeconds (60)
+"-r", "30", "-g", "60", "-keyint_min", "60", "-sc_threshold", "0", "-vsync", "cfr",
+"-x264-params", "open-gop=0:b-pyramid=none",
+
+// libx265
+$"keyint=60:min-keyint=60:scenecut=0:open-gop=0:repeat-headers=1:bframes=0:...",
+
+// HLS muxer
+"-f", "hls", "-hls_time", "2", "-hls_playlist_type", "vod",
+"-hls_flags", "independent_segments+round_durations",
+"-hls_segment_type", "fmp4",
+"-hls_fmp4_init_filename", initFileName,      // h264-init.mp4 / hevc-init.mp4
+```
+
+Constant 30 fps, a keyframe exactly every 60 frames, and scene-cut detection disabled means a keyframe lands on every 2-second boundary in every tier and codec. With closed GOPs, each segment decodes on its own, which is what `independent_segments` promises the player. Two-second segments are a deliberate choice for a feed: the first segment of a clip is small, so playback starts quickly, at the cost of more files and more requests.
+
+Segments are fragmented MP4 (`.m4s` with an init segment) rather than MPEG-TS, because HEVC in HLS needs fMP4 for Apple players.
+
+<Callout tone="warn">
+HEVC with B-frames in FFmpeg-packaged fMP4 HLS failed on iOS with AVFoundation error -12785. The cause was the init segment: with B-frames enabled, older FFmpeg builds write an empty `sdtp` atom, and AVFoundation rejects it. FFmpeg fixed it upstream in July 2025, but servers don't always run the latest build, so the HEVC encodes set `bframes=0`. The H.264 renditions keep two B-frames with `b-pyramid=none`. If your HEVC plays in VLC but not on an iPhone, inspect the init segment before you touch the encoder settings.
+</Callout>
+
+## 5. Playlists: tier masters and a top-level master
+
+After each tier finishes, its job calls `FeedHlsMasterPlaylistWriter`, which looks at what exists on disk and writes `master.m3u8`. Each tier contributes its codec master if present, or its H.264 playlist if not. Variants are sorted by bandwidth, and the writer refuses to produce a master with fewer than two variants:
+
+```csharp title="FeedHlsMasterPlaylistWriter.cs (trimmed)"
+variants.Sort((a, b) => a.BandwidthBps.CompareTo(b.BandwidthBps));
+var lines = new List<string> { "#EXTM3U", "#EXT-X-VERSION:6", "#EXT-X-INDEPENDENT-SEGMENTS" };
+foreach (VariantEntry v in variants)
+{
+    lines.Add($"#EXT-X-STREAM-INF:BANDWIDTH={v.BandwidthBps},RESOLUTION={v.Width}x{v.Height}," +
+              $"CODECS=\"{v.CodecsAttribute}\",NAME=\"{v.Name}\"");
+    lines.Add(v.RelativePath);
+}
+```
+
+Because the master is rebuilt from the files on disk each time, the tier jobs can finish in any order, and re-running one tier later (to backfill HEVC on old posts, for example) just rewrites the master with whatever exists.
+
+## 6. Let Nginx serve it
+
+Playback never touches .NET. Nginx serves the playlists and segments straight from disk with `sendfile`, and the cache headers follow from what can change:
+
+```nginx title="nginx-hls.example.conf (trimmed)"
+# inside the HLS location, placed before the reverse proxy to Kestrel
+sendfile on;
+tcp_nopush on;
+
+location ~* \.m3u8$ { add_header Cache-Control "public, max-age=10, must-revalidate"; }
+location ~* \.m4s$  { add_header Cache-Control "public, max-age=31536000, immutable"; }
+location ~* /hevc-init\.mp4$ { add_header Cache-Control "public, max-age=31536000, immutable"; }
+location ~* /h264-init\.mp4$ { add_header Cache-Control "public, max-age=31536000, immutable"; }
+```
+
+Once a tier is packaged, its segments and init files don't change during normal operation, so they can be cached for a year, and the phone's HTTP cache does the job a CDN edge would. Playlists are the only mutable files (the master gains variants as tiers finish), so they get a 10-second max-age. If a CDN goes in front later, these headers already say the right thing.
+
+## 7. Pick a tier, play one video, prewarm the next
+
+On the phone, the app picks a tier itself rather than leaving it all to the player's adaptive bitrate logic. Wi-Fi and Ethernet map to the best tier, cellular maps to Eco, and the user can override it, including a Data Saver mode:
+
+```ts title="utils/feedVideoQualityMode.ts"
+export function feedVideoQualityOverrideForNetworkType(type: NetworkStateType | undefined) {
+  if (type === NetworkStateType.WIFI || type === NetworkStateType.ETHERNET) return 'best';
+  if (type === NetworkStateType.CELLULAR) return 'eco';
+  return null;
+}
+```
+
+It also resolves tier codec masters to a single-codec playlist (HEVC first, H.264 as the fallback when hardware decode fails), because nested HEVC + H.264 masters were unreliable on iOS AVPlayer in testing.
+
+Players are the other cost. Each `expo-video` player holds a decoder and buffers, so the feed keeps **one active player**, for the visible cell only. Around it sits a small retention window: on Wi-Fi the next video is prewarmed and the previous one stays warm for scroll-back, with off-screen read-ahead capped at 2 seconds (one segment). On cellular, nothing is prewarmed. On Android, the next video is prewarmed but the previous one isn't kept.
+
+## What I'd tell you before you build one
+
+- **Start the ladder with the tier people will see.** Making Normal ready first, then queuing the cheaper tiers as separate jobs, kept failures and retries contained.
+- **Align keyframes to segments in every rendition.** Fixed GOP, `scenecut=0`, constant frame rate. Uneven segments show up as stalls that are miserable to debug.
+- **Treat HEVC as an optimization with an H.264 safety net.** Encode both, prefer HEVC, and fall back automatically, both on the server (H.264-only tier) and in the app (H.264 leaf).
+- **Budget memory for libx265 on a small box.** The HEVC encodes run with limited thread pools, and if the encoder gets OOM-killed, the job retries once with lighter settings before giving up on HEVC for that tier.
+- **Immutable segments make caching trivial, so keep them immutable.** The one gap I'd close: regenerating a tier (for example, an admin backfill) clears the directory and writes segments with the same file names, which a year-long `immutable` header doesn't expect. Writing each regeneration to a new versioned directory would make the cache headers true by construction.
+- **What I'd change:** the Normal tier is only marked ready after both its H.264 and its HEVC encodes finish, and the HEVC pass is the slow one. Marking Normal ready after H.264 and adding HEVC to the tier master afterwards would get posts live sooner.

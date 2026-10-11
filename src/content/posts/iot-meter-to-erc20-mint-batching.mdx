@@ -1,0 +1,142 @@
+---
+title: "From kilowatt-hours to tokens: batching smart-meter readings into ERC-20 mints"
+summary: "A smart meter reports a cumulative energy counter every few seconds, but you can't send a blockchain transaction every few seconds. This proof of concept shows how I turned Shelly meter readings into batched EnergyToken mints on BSC Testnet, and where minting authority has to live in a real system."
+date: "2026-06-25"
+project: "elex"
+tags: ["IoT", "React Native", "viem", "wagmi", "ERC-20", "Proof of concept"]
+---
+
+ELEX is a proof of concept for rewarding solar production. A Shelly energy meter sits on the home network, the owner connects a wallet in an Expo app, and the energy the panels produce turns into an ERC-20 "EnergyToken" in that wallet.
+
+The idea fits in one sentence. The details are where it gets interesting. The meter reports a **cumulative** counter in watt-hours, not "energy since last time". It sometimes doesn't answer. Its counter can reset. And a blockchain transaction has a cost and a latency that make "mint on every reading" a bad idea even on a testnet.
+
+So the core of the PoC is a small accumulator: read the counter, turn it into deltas, batch the deltas, and mint whole tokens while carrying the fraction forward. I prototyped it as a Node script (`poll_mint_new.js`) and then moved the same loop into a React hook so I could watch it run on a phone.
+
+## The flow end to end
+
+<Flow steps={[
+  ["App", "The owner connects a wallet through Reown AppKit (WalletConnect). wagmi exposes the connected address."],
+  ["App", "The saved meter address is loaded from AsyncStorage, and the tabs layout starts polling every 5 seconds."],
+  ["Shelly meter", "Answers the local RPC call Switch.GetStatus with live power and the cumulative aenergy.total in Wh."],
+  ["App", "Normalizes the response. The first good reading becomes the baseline and mints nothing."],
+  ["App", "Adds each positive delta to an accumulator and ignores negative ones. Three failed polls in a row mark the meter offline."],
+  ["App", "Batch gate: no mint in flight, at least 5 seconds since the last batch, and more than 0.001 Wh accumulated."],
+  ["BSC Testnet", "mint(to, amount) on the EnergyToken contract, with floor(Wh × 100) whole tokens at 8 decimals."],
+  ["App", "Keeps the fractional remainder for the next batch. On failure, the whole accumulator stays and is retried."],
+]} />
+
+## 1. Talk to the meter, and don't trust its shape
+
+Shelly devices expose a JSON-RPC API over HTTP on the local network. The status call is a plain GET to `/rpc/Switch.GetStatus?id=0`. Two things made this less trivial than it looks.
+
+First, a phone on flaky Wi-Fi can leave a `fetch` hanging for a long time, and React Native's `fetch` has no timeout option. An `AbortController` fixes that. Second, different Shelly models and firmware nest the reading differently: some return a `switch:0` node, power-meter models use `pm1:0`, and `Switch.GetStatus` itself returns the node flat. I normalized all three into one shape:
+
+```ts title="libs/shelly.ts (trimmed)"
+const STATUS_PATH = '/rpc/Switch.GetStatus?id=0';
+const FETCH_TIMEOUT_MS = 20_000;
+
+export async function fetchShellyStatus(ip: string): Promise<ShellyMeterData> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${getBaseUrl(ip)}${STATUS_PATH}`, { signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const raw = (await res.json()) as ShellyGetStatusResponse;
+    const node = raw['switch:0'] ?? raw['pm1:0'] ?? (isMeterNode(raw) ? raw : undefined);
+    if (!node) throw new Error('No switch:0, pm1:0 or flat meter DTO in response');
+    return {
+      powerW: node.apower ?? 0,
+      energyWh: node.aenergy?.total ?? 0,   // cumulative counter, in Wh
+      voltage: node.voltage,
+      current: node.current,
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+```
+
+`isMeterNode` is a small type guard: an object counts as a reading if it has a numeric `apower` or an `aenergy` object. Everything downstream works with `ShellyMeterData` and never sees which model answered.
+
+## 2. Turn a cumulative counter into deltas
+
+The polling hook is mounted once in the tabs layout, so it keeps running whichever screen is open. Its state lives in refs, not React state, because none of it should trigger a re-render:
+
+```ts title="hooks/useMeterPolling.ts (trimmed)"
+const result = await fetchShellyStatus(ip);
+const currentWh = result.energyWh;
+useMeterStore.getState().setData(result);
+useMeterStore.getState().setOnline(true);
+failCountRef.current = 0;
+
+if (prevWhRef.current === null) {        // first reading: baseline only
+  prevWhRef.current = currentWh;
+  return;
+}
+
+const delta = currentWh - prevWhRef.current;
+if (delta > 0) accumulatedDeltaRef.current += delta;   // ignore resets
+prevWhRef.current = currentWh;
+```
+
+Three rules are doing the work:
+
+- **Baseline first.** The counter on a meter that's been installed for a year might read 1,400,000 Wh. Treating the first reading as a delta would mint a year of production on first launch. The first reading only sets `prevWh`.
+- **Positive deltas only.** A reboot or firmware update can reset `aenergy.total` to zero. That shows up as a large negative delta, which is dropped, and the new lower value becomes the baseline. No energy is double-counted and nothing goes negative.
+- **Offline after three failures.** A single timeout on home Wi-Fi isn't news. The catch block counts consecutive failures and only flips the Zustand store's `online` flag after three. Any success resets the count. Missed polls lose nothing, because the next good reading's delta covers the whole gap.
+
+Changing the meter address in settings resets the baseline and the accumulator. Otherwise the first reading from meter B would be compared against meter A's counter.
+
+<Callout tone="warn">
+Never compute energy from instantaneous power × poll interval. `apower` is a snapshot, and integrating it from the client drifts every time a poll is late or missed. The meter already integrates internally. Use its cumulative counter and difference it.
+</Callout>
+
+## 3. Batch, floor and carry
+
+Minting is gated three ways: no mint already in flight, at least `BATCH_INTERVAL_SEC` since the last batch, and more than `MIN_DELTA_WH` accumulated. The token amount is floored to whole tokens, and the fraction is kept:
+
+```ts title="hooks/useMeterPolling.ts (trimmed)"
+if (isMintingRef.current) return;
+const sinceLast = Date.now() - lastBatchRef.current;
+if (sinceLast < BATCH_INTERVAL_SEC * 1000 || accumulatedDeltaRef.current <= MIN_DELTA_WH) return;
+
+const rawTokens = accumulatedDeltaRef.current * TOKENS_PER_WH;   // 100 tokens per Wh
+const tokens = Math.floor(rawTokens);
+if (tokens <= 0) { lastBatchRef.current = Date.now(); return; }
+
+isMintingRef.current = true;
+try {
+  const amount = parseUnits(tokens.toString(), ENERGY_TOKEN_DECIMALS);   // 8 decimals
+  const hash = await walletClient.writeContract({
+    address: ENERGY_TOKEN_ADDRESS_BSC_TESTNET,
+    abi: energyTokenAbi,
+    functionName: 'mint',
+    args: [toAddress, amount],
+  });
+  accumulatedDeltaRef.current = (rawTokens - tokens) / TOKENS_PER_WH;  // carry the fraction
+  lastBatchRef.current = Date.now();
+} finally {
+  isMintingRef.current = false;
+}
+```
+
+The **in-flight lock** matters more than it looks. Polls fire every 5 seconds, and a testnet transaction can take longer than that to submit. Without the lock, two overlapping polls would both see the same accumulated energy and mint it twice.
+
+**Flooring and carrying** keeps the books exact over time. If a batch has 2.37 tokens' worth of energy, 2 are minted and 0.37 rolls into the next batch. Across a day nothing is rounded away, and the contract never sees a fractional amount it would have to truncate. On failure the accumulator isn't touched, so the energy is simply included in the next attempt.
+
+The recipient is the wallet connected through Reown AppKit. The app wraps the tree in `<AppKit />`, the connect button calls `useAppKit().open()`, and wagmi's `useAccount()` provides the address. The connected-wallet view reads the owner's `balanceOf` with wagmi's `useReadContract`, next to the native balance.
+
+<Callout tone="tip">
+These constants (5-second batches, a 0.001 Wh threshold, 100 tokens per Wh) are tuned to make a demo *visible*: plug in a kettle and watch the balance move. A real tariff would batch hourly or daily, and the exchange rate would be a business decision, not a constant in a hook.
+</Callout>
+
+## What I'd tell you before you build one
+
+The accumulator logic is solid and I'd reuse it as is. Where it runs is the part I'd change completely for anything beyond a demo.
+
+- **Minting authority does not belong in the client.** A PoC can call `mint` from the polling loop to get a fast feedback cycle on a testnet. A production system must not. Whoever can call `mint` can create tokens, so that authority belongs to a backend or oracle service whose signing key sits in a KMS or HSM, never in an app bundle or on a user's device. The contract should restrict `mint` to that service's address through a role such as `MINTER_ROLE`, and the app should only read balances.
+- **Make readings attestable.** If the app reports "I produced 3 Wh", anyone can claim any number. Readings should be signed at the source, by a gateway or a secure element next to the meter with its own device key, and the oracle should verify each signature, check that the counter only moves forward, reject physically impossible jumps and cap issuance per device per period before it mints.
+- **Make mints idempotent.** Key each mint by device and reading window, and record it before submitting, so a retried transaction or a restarted worker can never mint the same energy twice.
+- **Subtract, don't overwrite.** The carry step assigns the remainder back to the accumulator after `await`. Any energy a poll added while the transaction was in flight is overwritten. The fix is one line: `accumulatedDeltaRef.current -= tokens / TOKENS_PER_WH`.
+- **Count in integers.** Floating-point Wh accumulated over thousands of polls drifts. Storing milliwatt-hours as an integer, or a `bigint` in token base units, keeps the ledger exact.
+- **Persist the accumulator.** It lives in refs, so a restart resets the baseline and any un-minted remainder is dropped, along with the energy produced while the app was closed. In the backend design this goes away naturally: the oracle keeps the last attested counter per device, and nothing depends on a phone being awake.

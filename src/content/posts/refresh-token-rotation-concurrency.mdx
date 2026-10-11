@@ -1,0 +1,190 @@
+---
+title: "Refresh-token rotation that doesn't log out users with five tabs open"
+summary: "Rotating refresh tokens on every use is good security, but a naive implementation turns parallel requests into random logouts. Here's the Redis lock, grace-replay cache and client-side single flight I use so concurrent refreshes all get the same new tokens."
+date: "2026-10-06"
+project: "qashio"
+tags: ["Authentication", "NestJS", "Redis", "Concurrency", "Next.js"]
+---
+
+Qashio uses short-lived access tokens and long-lived refresh tokens, and the refresh token is **rotated on every use**: each call to `/auth/refresh` returns a new refresh token, and the old one stops working. That's the standard advice, because a stolen refresh token then has a short useful life.
+
+The obvious implementation is three steps: look up the session by the token's hash, write a new hash, return the new pair. It passes every single-request test, and it logs real users out at random.
+
+The cause was concurrency. The web app keeps the refresh token in a cookie that every tab shares, and each tab keeps its own access token in memory. Restore a browser window with five Qashio tabs and five tabs boot at once, each calling `/auth/refresh` with the same token. The first request rotates it. The other four arrive with a token that no longer exists, get a 401, and the app does what it should on a 401 from refresh: it clears the session, shared cookie included. One losing tab logs out every tab. A milder version happens inside a single tab when the access token expires while a dashboard fires several queries in parallel.
+
+Rotation is meant to stop an *attacker* from reusing a token. Here it was stopping the legitimate user from using it twice in the same 200 milliseconds.
+
+## The flow end to end
+
+<Flow steps={[
+  ["Browser tab", "Gets a 401 on a data request. If no refresh is in flight in this tab, it starts one and stores the promise; other failed requests await the same promise."],
+  ["API", "Hashes the presented refresh token (SHA-256). Every later step is keyed by the hash, never by the raw token."],
+  ["Redis", "Grace cache: is there a rotation result for this hash from the last 30 seconds? If so, return it unchanged."],
+  ["Redis", "SET NX PX 5000 on a lock for this hash. Exactly one request wins."],
+  ["API (losers)", "Poll the grace cache every 100 ms, for up to 5 seconds, and return the winner's result once it appears."],
+  ["API (winner)", "Loads the session, checks it and the user are active, writes the new token hash, signs a new access token."],
+  ["Redis", "Winner caches the result under the old hash for 30 seconds, then releases the lock."],
+  ["Browser tab", "Saves the new refresh token, retries the original requests with the new access token."],
+]} />
+
+## 1. Key everything by the hash
+
+The server never stores refresh tokens, only their hashes. A refresh token is 48 random bytes, base64url-encoded, and the session row holds its SHA-256. A fast unsalted hash is fine here because the input is high-entropy random data, not a password, so there's nothing to brute-force.
+
+The rotation logic reuses that hash as its coordination key. The lock and the cached result are both keyed by it, so the raw token never touches Redis either:
+
+```ts title="refresh-session.use-case.ts (trimmed)"
+export const REFRESH_LOCK_TTL_MS = 5_000;
+export const REFRESH_GRACE_MS = 30_000;
+const WAIT_POLL_MS = 100;
+
+async execute(command: RefreshSessionCommand): Promise<AuthTokensResult> {
+  const hash = this.tokens.hashRefreshToken(command.refreshToken);
+
+  const replay = await this.rotations.getResult<AuthTokensResult>(hash);
+  if (replay) return replay;
+
+  if (!(await this.rotations.tryLock(hash, REFRESH_LOCK_TTL_MS))) {
+    // Another request is rotating this exact token: share its result.
+    return this.waitForRotation(hash);
+  }
+
+  try {
+    const result = await this.rotate(hash);
+    await this.rotations.saveResult(hash, result, REFRESH_GRACE_MS);
+    return result;
+  } finally {
+    await this.rotations.release(hash);
+  }
+}
+```
+
+The order matters. The grace cache is checked *before* trying the lock, so a late request (another tab booting 10 seconds later with the old cookie value) never contends for anything. It gets the answer straight from the cache.
+
+## 2. An atomic lock with an expiry
+
+The lock is a single Redis command:
+
+```ts title="redis-refresh-rotation.store.ts (trimmed)"
+async tryLock(tokenHash: string, ttlMs: number): Promise<boolean> {
+  // SET NX PX: atomic "claim if free" with expiry, so a crashed holder cannot block forever.
+  const result = await this.redis.set(this.lockKey(tokenHash), '1', 'PX', ttlMs, 'NX');
+  return result === 'OK';
+}
+
+async saveResult<T>(tokenHash: string, result: T, ttlMs: number): Promise<void> {
+  await this.redis.set(this.resultKey(tokenHash), JSON.stringify(result), 'PX', ttlMs);
+}
+```
+
+`NX` makes it a compare-and-set: only one caller can create the key. `PX` puts the expiry in the same command, so there's no window where the lock exists without a TTL. If the API process dies mid-rotation, the lock disappears after 5 seconds on its own.
+
+The 5-second TTL is sized as an upper bound for one rotation: a session read, an update and a JWT signature. It's also the losers' maximum wait, which keeps the two numbers consistent. A loser never gives up while a healthy winner could still be working.
+
+The use case only sees a `RefreshRotationStorePort` with four methods: `tryLock`, `release`, `getResult` and `saveResult`. That port is what makes the concurrency testable without Redis, which I'll come back to.
+
+## 3. Losers wait for the winner's answer
+
+A request that loses the lock doesn't fail and doesn't rotate. It polls the grace cache:
+
+```ts title="refresh-session.use-case.ts"
+private async waitForRotation(hash: string): Promise<AuthTokensResult> {
+  for (let waited = 0; waited < REFRESH_LOCK_TTL_MS; waited += WAIT_POLL_MS) {
+    await sleep(WAIT_POLL_MS);
+    const result = await this.rotations.getResult<AuthTokensResult>(hash);
+    if (result) return result;
+  }
+  // The holder failed (e.g. token was already invalid): treat like an invalid token.
+  throw new UnauthorizedException('Invalid refresh token');
+}
+```
+
+`sleep` is `setTimeout` from `node:timers/promises`, no helper needed. Polling every 100 ms is crude next to Redis pub/sub or keyspace notifications, but a rotation is only a couple of queries and a signature, so losers typically find the result within the first few polls. It costs a handful of `GET`s per contested refresh and has no subscription lifecycle to manage.
+
+The failure path is deliberate. If the token was invalid (unknown, revoked, or the user was deactivated), the winner throws, and **nothing is cached**, because `saveResult` only runs after `rotate` succeeds. The losers time out and get the same 401. A failed rotation never gets replayed as a success.
+
+<Callout tone="warn">
+Only cache successes. If you cache the outcome of a rotation regardless of result, a transient database error on the winner gets replayed to every tab for the next 30 seconds, and nobody recovers until the entry expires.
+</Callout>
+
+## 4. The winner rotates once
+
+The winner does the actual rotation, which looks like the naive version:
+
+```ts title="refresh-session.use-case.ts (trimmed)"
+private async rotate(hash: string): Promise<AuthTokensResult> {
+  const session = await this.sessions.findByRefreshTokenHash(hash);
+  if (!session || !session.isActive) throw new UnauthorizedException('Invalid refresh token');
+
+  const user = await this.users.findById(session.userId);
+  if (!user || !user.isActive) throw new UnauthorizedException('Invalid refresh token');
+
+  const refreshToken = this.tokens.generateRefreshToken();
+  const updated = await this.sessions.updateRefreshTokenHash(
+    session.id, this.tokens.hashRefreshToken(refreshToken), this.tokens.getRefreshExpiresAt(),
+  );
+  const accessToken = await this.tokens.signAccessToken({
+    sub: user.id, sid: updated.id, email: user.email,
+  });
+  return { accessToken, refreshToken, user: { id: user.id, email: user.email, displayName: user.displayName } };
+}
+```
+
+Each session row holds exactly one current hash, so after this update the old token can't be found in the database anymore. Only the 30-second cache can still answer for it. Every caller in that window gets the *same* new refresh token, which matters for the multi-tab case: all tabs end up writing the same value to the shared cookie, and no tab is left holding a token that a sibling tab has already rotated away.
+
+## 5. Single flight in the browser
+
+The server makes concurrent refreshes safe. The client makes them rare. In `http-client.ts`, the Axios response interceptor keeps one module-level promise:
+
+```ts title="http-client.ts (trimmed)"
+let refreshPromise: Promise<string | null> | null = null;
+
+if (status === 401 && !original._retry && !isAuthEndpoint) {
+  original._retry = true;
+
+  if (!refreshPromise) {
+    refreshPromise = refreshAccessToken().finally(() => {
+      refreshPromise = null;
+    });
+  }
+
+  const accessToken = await refreshPromise;
+  if (accessToken) {
+    original.headers.Authorization = `Bearer ${accessToken}`;
+    return apiClient.request(original);
+  }
+}
+```
+
+Several parallel queries that all get a 401 produce one `/auth/refresh` call, and each request is retried once with the new token. The `_retry` flag stops a request from looping if the retry also fails, and auth endpoints are excluded so a 401 from `/auth/refresh` itself can't trigger another refresh. `refreshAccessToken` posts with plain `axios` rather than `apiClient`, so the refresh call doesn't go through the interceptor at all.
+
+This is per tab, though. A module-level variable can't coordinate across tabs, and the bootstrap refresh that runs when a tab loads goes through a different path. That's exactly why the server-side grace window exists. Each layer covers what the other can't.
+
+<Callout tone="tip">
+Do both. Client-side single flight cuts the load and the noise; server-side coordination is the guarantee, because you never control every client, tab or retry.
+</Callout>
+
+## Testing the race
+
+The concurrency spec swaps Redis for an in-memory store with real `NX` semantics: a `Set` for locks and a `Map` for results. The session lookup is mocked to take 150 ms so two calls genuinely overlap:
+
+```ts title="refresh-session-concurrency.spec.ts (trimmed)"
+const [first, second] = await Promise.all([
+  useCase.execute({ refreshToken: 'old-refresh' }),
+  useCase.execute({ refreshToken: 'old-refresh' }),
+]);
+
+expect(sessions.updateRefreshTokenHash).toHaveBeenCalledTimes(1);
+expect(first).toEqual(second);
+expect(first.refreshToken).toBe('refresh-1');
+```
+
+Two more cases cover the edges: a late request with the old token gets the cached result without a second database lookup, and an invalid token rejects *every* concurrent caller with `UnauthorizedException`. That last test runs with a 10-second timeout because the loser really does wait out the full 5-second lock TTL.
+
+## What I'd tell you before you build one
+
+- **Naive rotation is a concurrency bug, not a security feature.** If your users have several tabs or your app fires parallel requests, plain rotate-and-invalidate will log people out. Plan for concurrent refreshes from the start.
+- **The grace window is a trade-off, so keep it short.** For 30 seconds, the old token keeps working and gets the new pair. That's deliberate leniency toward the legitimate user, and during that time the cached pair is a live credential sitting in Redis. Thirty seconds covers tab restores and slow networks; I wouldn't go much higher.
+- **Think through reuse detection before you pick a window.** The strict pattern from the OAuth security guidance treats any reuse of a rotated token as theft and revokes the whole session. It's a strong signal, but it can't tell an attacker from a second tab, which is the exact problem this post is about. A grace window and reuse detection can coexist: replay inside the window, and treat a presentation of the old hash *after* it as suspicious. Qashio today does the first half; outside the window an old token simply gets a 401. Revoking the session on that late reuse is the next step I'd add, since the grace window has already absorbed the benign cases.
+- **Release locks you own.** `release` deletes the lock key unconditionally. That's safe here because the TTL comfortably exceeds a rotation, but the textbook version stores a random owner value and deletes only if it still matches, so a holder that overran its TTL can't release someone else's lock. It's a small change, and I'd make it before reusing this store anywhere slower.
+- **Put the coordination behind a port.** Four methods on an interface gave me a deterministic in-memory version for tests and kept Redis details out of the use case.

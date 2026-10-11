@@ -1,0 +1,156 @@
+---
+title: "Variety-aware crop timelines: a farm-science engine as pure, offline TypeScript"
+summary: "A maize field planted with a 90-day hybrid shouldn't get the same phase dates as a 120-day local composite. Here's the small, dependency-free library behind E-Farmer's crop timelines, how it scales stages per variety and re-plans from what actually happened, and why one copy of the data beats three."
+date: "2026-10-08"
+project: "pro-e-farmer"
+tags: ["TypeScript", "Domain modeling", "Agritech", "Offline-first", "Electron"]
+---
+
+When a farmer starts a crop cycle in E-Farmer, the app shows a timeline: germination, vegetative growth, flowering and so on up to harvest, with dates, field advice for each phase, a recommended plant count and an expected yield. Alerts fire when a phase starts or is about to end.
+
+One set of stage durations per crop would be wrong in a way farmers notice right away. CMS 8704, a Cameroonian open-pollinated maize, takes about 111 days to maturity. SC 513, an early hybrid grown in East and Southern Africa, takes about 90. Real fields also don't follow the calendar: germination finishes early after good rain, or flowering drags in a dry spell.
+
+Everything has to work offline too, so the science can't live behind an API. It's a plain TypeScript library in `libs/shared/src/farm/science` with no I/O. The Electron main process and the Angular renderer import the same code.
+
+## The flow end to end
+
+<Flow steps={[
+  ["Farmer", "Creates a cycle: crop, variety code, start date, start stage (seedlings can start past germination) and a day offset."],
+  ["Science pack", "CROP_SCIENCE_PACKS gives the crop's stages, durations, advice, planting density and typical yield."],
+  ["Variety", "getEffectiveCropStages applies the variety: explicit stage overrides, or proportional scaling to daysToMaturity."],
+  ["Main process", "The local API saves the cycle with estimateExpectedHarvestDate computed from those stages."],
+  ["Farmer", "Marks a phase complete on the day it really ended. That's stored in a phaseActuals map, not as a current stage."],
+  ["Science", "getCropCycleProgress chains actual end dates into the start of the next stage and re-estimates everything after it."],
+  ["Renderer + main", "The detail page draws the timeline; the offline farm jobs use the same function to send phase-change and phase-ending alerts."],
+]} />
+
+## 1. A science pack per crop
+
+Each crop has a pack: the stored stage keys with their durations and advice, preferred soils and irrigation, harvest products, planting density and a typical yield. Here's an excerpt of the maize pack:
+
+```ts title="crops/packs.ts (excerpt)"
+[CropTypeEnum.MAIZE]: {
+  cropType: CropTypeEnum.MAIZE,
+  name: 'Maize',
+  // MINADER grain-maize sheet (2024): 75–80 cm × 25–50 cm, ~53,000 plants/ha, 20–25 kg seed/ha
+  recommendedPlantsPerM2: 5.3,
+  primaryPlantingUnit: PlantingUnitEnum.SEED_KG,
+  seedingRateKgPerHa: 25,
+  typicalYieldPerHa: 3500,
+  defaultRowSpacingCm: 75,
+  defaultSpotSpacingCm: 25,
+  stages: [
+    { key: CropGrowthStageEnum.GERMINATION, durationDays: 7, advice: 'Keep soil moist; …' },
+    { key: CropGrowthStageEnum.VEGETATIVE, durationDays: 45, advice: 'Weed early; top-dress nitrogen …' },
+    { key: CropGrowthStageEnum.TASSELING, durationDays: 7 },
+    { key: CropGrowthStageEnum.SILKING, durationDays: 7 },
+    { key: CropGrowthStageEnum.GRAIN_FILL, durationDays: 38 },
+    { key: CropGrowthStageEnum.MATURITY, durationDays: 15 },
+  ],
+  // soils, irrigation, harvest products…
+},
+```
+
+The numbers aren't made up. I checked them against published sources: the national agriculture ministry's crop sheets for maize and tomato, IITA guidance for cassava and plantain, breeder management guides for laying hens, and FAO material. Comments next to the values record the source and, where a value was corrected, what it replaced, for example a tomato yield lowered from 45 to 20 t/ha. When a number gets challenged, the source is right next to it.
+
+Today there are four packs: maize (119 days), tomato (126), cassava (374) and plantain (390).
+
+## 2. Varieties: override or scale, then fix the rounding
+
+A variety is a small record keyed by a `code`, which is what `crop_cycles.variety` stores:
+
+```ts title="crops/varieties.ts (excerpt)"
+{
+  code: 'cms_8704',
+  cropType: CropTypeEnum.MAIZE,
+  name: 'CMS 8704',
+  daysToMaturity: 111,
+  regionHints: ['CEMAC', 'Cameroon'],
+  notes: 'IRAD/Cameroon open-pollinated; ~111 days to maturity.',
+},
+```
+
+The type also allows explicit `stageDurationOverrides`, its own planting density and spacing. Every variety in the catalog today sets only `daysToMaturity`, because that's the figure seed catalogs publish. So `getEffectiveCropStages` resolves durations in priority order: explicit overrides, then proportional scaling, then the pack defaults.
+
+```ts title="crops/index.ts (trimmed)"
+const baseTotal = pack.stages.reduce((sum, s) => sum + s.durationDays, 0);
+const scale = variety.daysToMaturity / baseTotal;
+const scaled = pack.stages.map((s) => ({
+  key: s.key,
+  durationDays: Math.max(1, Math.round(s.durationDays * scale)),
+  advice: s.advice,
+}));
+
+// Fix rounding drift on the last stage so totals match daysToMaturity
+const scaledTotal = scaled.reduce((sum, s) => sum + s.durationDays, 0);
+const drift = variety.daysToMaturity - scaledTotal;
+if (drift !== 0 && scaled.length) {
+  const last = scaled[scaled.length - 1];
+  last.durationDays = Math.max(1, last.durationDays + drift);
+}
+```
+
+Rounding each stage on its own doesn't add up. For CMS 8704 the scale is 111/119. The stages round to 7, 42, 7, 7, 35 and 14, which is **112** days, one more than the variety's published maturity. The drift correction takes that day off maturity, giving 7/42/7/7/35/13. For SC 513 (90 days) the rounded stages sum to 89, and maturity gets the extra day. `Math.max(1, …)` stops a short stage from rounding down to zero and disappearing from the timeline.
+
+<Callout tone="warn">
+Put the correction on the **last** stage, not spread across all of them. Maturity is the stage farmers judge by eye anyway ("harvest when kernels dent"), so a day more or less there is harmless. Shift germination by a day and every later date moves with it.
+</Callout>
+
+Advice always comes from the pack, so a variety never needs its own copy of the agronomy text. And because the lookup returns pack defaults for an unknown code, a cycle saved with a variety that was later removed still gets a timeline.
+
+## 3. Progress that learns from the field
+
+A crop cycle doesn't store a "current stage". `getCropCycleProgress` computes it from the start date, the start stage and offset, the variety, and `phaseActuals`, a map of the real end date of each completed phase. Marking a phase complete only patches that map.
+
+The key step is chaining. Each stage starts when the previous one *actually* ended, or when it was estimated to end if it hasn't been marked yet:
+
+```ts title="crops/index.ts (trimmed)"
+let chainStart = cycleStartIso;
+for (const stage of timeline) {
+  // (stages before the cycle's start stage are skipped)
+  stage.actualStartDate = chainStart;
+  stage.estimatedEndDate = addDaysIso(chainStart, stage.durationDays);
+  const recorded = actuals[stage.key]?.actualEndDate;
+  if (recorded) {
+    stage.actualEndDate = toIsoDay(recorded);
+    stage.isManuallyCompleted = true;
+    chainStart = stage.actualEndDate;
+  } else {
+    stage.actualEndDate = null;
+    stage.isManuallyCompleted = false;
+    chainStart = stage.estimatedEndDate; // keep projecting later stages
+  }
+}
+```
+
+Say a CMS 8704 field is planted on April 1 and germination is marked done on April 5, three days early. Vegetative now starts April 5 instead of April 8, and every later estimate moves up three days. The projected end of maturity goes from July 21 to July 18. Once any actual is recorded, the current stage is the first one after the last completed phase, and "days in stage" counts from its real start. A stopped or harvested cycle passes `freezeAt` so its clock stops.
+
+## 4. Recommendations by region
+
+Each variety has `regionHints` like `'CEMAC'`, `'West Africa'` or a country name. `regions.ts` maps those groups to ISO country codes, and `recommendedCropTypes(country)` returns the crops with at least one variety suited to the farm's country:
+
+```ts title="crops/regions.spec.ts (excerpt)"
+expect(regionTagsFor('CM')).toEqual(['Cameroon', 'CEMAC']);
+expect(recommendedCropTypes('KE')).toEqual([CropTypeEnum.MAIZE, CropTypeEnum.TOMATO]);
+// No variety data for France: nothing is recommended.
+expect(recommendedCropTypes('FR')).toEqual([]);
+```
+
+A variety tagged `'Cameroon'` is suggested only there; one tagged `'CEMAC'` is suggested in all six member states. The crop-cycle form sorts those crops first and badges them as recommended. It never hides the others.
+
+## 5. The livestock side, briefly
+
+The same library holds the animal science, as plain lookup tables. Breeding constants per species: age at first heat, heat duration, gestation (114 days for pigs), weaning, and the wait before the next expected heat (21 days, one cycle, for a pig with a missed heat; 5 days from weaning for sows). Laying curves are hen-day rates for each breed in three phases (peak, mature, decline), capped at what the breeder guides support: no strain lays 100%, and the peak stays at or below 96%. A young flock is held to a ramp from about week 18 to week 24 instead of being judged against the peak, so a 20-week-old flock isn't marked as underperforming.
+
+In the main process, these tables drive the offline farm jobs (ages, feed estimates, heat windows) and the expected egg counts. In the renderer, they give the breeding dialog its due date and the egg page its laying curve. Both sides import the same shared package.
+
+<Callout tone="tip">
+Keep domain science as data plus small pure functions, with no I/O and no framework imports. Then it runs in Electron's main process, in the browser, in a Node test runner and in a background job without a single adapter.
+</Callout>
+
+## What I'd tell you before you build one
+
+- **Copies drift. Mine did.** This library started as a copy of the mobile app's science folder, and the API bundles its own copy too. When I checked the numbers against the sources, the corrections landed in the desktop package only. The mobile and API copies still have the old maize stages (7/35/14/14/35/14 instead of 7/45/7/7/38/15), 5.5 plants/m² instead of 5.3, and a 45 t/ha tomato yield. Same product, two different answers depending on which screen you open. Inside the desktop app, one package shared by main and renderer has already removed the problem. The next step is to publish that package and have the mobile app and the API consume it, instead of syncing by hand.
+- **Store facts, compute state.** Persisting `phaseActuals` instead of "current stage" means a corrected date or a new variety duration re-plans every existing cycle on the next render. No migration needed.
+- **Write down the source next to the number.** A one-line comment with the reference and the old value makes it much harder for anyone, me included, to "fix" a value back to the wrong one later.
+- **Test the math directly.** The region rules have their own spec, and the timelines are covered through the local API and farm-job specs (harvest date on create and edit, phase-change alerts). The scaling and chaining functions deserve their own table-driven tests, CMS 8704's drift included. That's next on my list.

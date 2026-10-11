@@ -1,0 +1,147 @@
+---
+title: "No report left behind: write-ahead drafts in a Flutter app for bad networks"
+summary: "When a field agent submits an incident report from a place with one bar of signal, the request can fail after they've already moved on. Here's the write-ahead draft pattern I used in a Flutter app for human-rights NGOs: persist to SQLite first, delete only on success, and replay the rest."
+date: "2026-05-22"
+project: "ngo-incident-reporting"
+tags: ["Flutter", "Dart", "SQLite", "Offline-first", "Mobile"]
+---
+
+I work on a white-label Flutter app that human-rights NGOs use to document incidents and follow up with victims. Field agents file reports, and victims can file their own. The same codebase ships under several organisations' brands.
+
+The hard constraint is connectivity. Reports are often written where the network is poor or unstable. Someone spends ten minutes describing what happened, taps **Save**, and the request times out. If the app shows an error and throws the form away, that testimony is gone, and the person who gave it may not be reachable again.
+
+So the rule I built around is simple: **a report touches the disk before it touches the network.** This is the write-ahead idea from databases, applied to a form.
+
+## The flow end to end
+
+<Flow steps={[
+  ["Form screen", "Saves in-progress fields to secure storage as the user types, then validates the form on Save."],
+  ["Form screen", "Builds the payload and writes it to the notices_draft SQLite table, keyed by a draft ID."],
+  ["Form screen", "Calls the API to create the incident."],
+  ["API", "Success: the screen deletes the draft row and clears the saved form. Failure: the draft stays."],
+  ["Incidents screen", "A Drafts toggle lists every row still in notices_draft as a draft card."],
+  ["Draft card", "Tapping a card reopens the form with the draft payload, which resubmits it through the same path."],
+  ["App start", "In one variant of the app, main() also walks notices_draft at launch and resubmits each draft in the background."],
+]} />
+
+## 1. Write the draft, then call the API
+
+All the logic lives in `proceedSaveNotice()` on the incident form. For a new incident, the draft insert comes *before* the network call, and the delete only happens on the success branch:
+
+```dart title="form_incidents.screen.dart (trimmed)"
+datas = {
+  'area': _areaControl.value.text,
+  'details': _detailsControl.value.text,
+  'type_id': _selectedOptionType?.id,
+  'flag_id': _selectedOptionFlag?.id,
+  'user_id': _selectedOptionVictim?.id,
+  'country': _selectedOptionCountries?.name,
+  'city': _selectedOptionCities?.name,
+  'date_occured': Apiutils.formatToTimestamp(_selectedDate),
+};
+
+storage.insertDataInStorage("notices_draft", dataKey, jsonEncode(datas), 0);
+response = await noticeService.createNotice(datas, victim: isVictimUser);
+
+if (response['status'] == false || response['status'] == "false") {
+  SessionUtils.toastAlert(" Error. ${response['message']} ", bgColor: Colors.red);
+  // the draft row is intentionally left in place
+} else {
+  storage.deleteDataFromStorage("notices_draft", dataKey);
+  emptyFormFields();
+}
+```
+
+There's a second, lighter safety net. `saveFormFields()` writes the current field values into the session store under a `form_notice` key, on field changes and once more before the payload is built, and `getUnsaveFormData()` restores them when the form opens. If the OS kills the app while someone is typing, they come back to their text, not an empty form.
+
+Edits to existing incidents skip the draft table. The data already exists on the server, so a failed update loses nothing that can't be retyped.
+
+<Callout tone="tip">
+The order is the whole pattern. *Persist, then send, then delete on confirmed success.* Any failure in between, whether a timeout, a 500, a killed app or a dead battery, leaves you with a row you can retry. Swap the first two steps and every failure is data loss.
+</Callout>
+
+## 2. Drafts are a first-class list
+
+A draft that the user can't see is a draft they'll retype, and then you have duplicates. So the incidents screen has a Drafts toggle in its header. `getLocalDatas()` reads the table and turns each row into a card:
+
+```dart title="incidents.screen.dart (trimmed)"
+dynamic dataDraft = await storage.getDataFromStorage("notices_draft");
+for (var incident in dataDraft?.reversed ?? []) {
+  dynamic noticeData = jsonDecode(incident["datas"]);
+  noticeData['dataKey'] = incident["id"];      // carried so a resubmit can delete it
+  itemsDraft.add(ListDraftItem(
+    id: incident['id'],
+    subtitle: noticeData['details'],
+    draftData: noticeData,
+    date: Apiutils.formatToTimestampEpoch(noticeData['date_occured']),
+  ));
+}
+```
+
+Each `IncidentDraftCard` is a button that routes back to the form with the payload attached. When the form's `initState` sees `draftdata`, it calls `proceedSaveNotice()` immediately. The draft branch reuses the stored payload and `dataKey`, so the same success/failure handling applies. A successful resubmit deletes exactly the row it came from.
+
+In the other app variant, `main()` also calls `checkNoticesDrafts()` at startup. It loops over the table, posts each payload and deletes the row only when the API returns `status == true`. Agents who reopen the app on Wi-Fi get their backlog flushed without tapping anything.
+
+There's a `polls_draft` table in the schema too, created alongside `notices_draft`, but follow-up polls don't write to it yet. Today they only persist in-progress form fields. Wiring them into the same insert-then-send path is next.
+
+## 3. Sessions: decode the JWT locally, guard by role
+
+Offline-first also changes how you check a session. Calling the API on every screen to ask "am I still logged in?" fails exactly when the network does. So `checkUserSession()` reads the token from secure storage and decodes the `exp` claim locally:
+
+```dart title="auth.service.dart (trimmed)"
+var data = await storage.read(key: "authToken") ?? "";
+if (data.isEmpty) return false;
+
+String payload = data.split(".")[1];
+while (payload.length % 4 != 0) payload += '=';     // base64url needs padding
+
+final claims = jsonDecode(utf8.decode(base64Url.decode(payload)));
+final expiresAt = claims["exp"] * 1000;
+
+if (DateTime.now().millisecondsSinceEpoch < expiresAt) return true;
+return init ? false : await validateToken(victim: victim);   // only now ask the API
+```
+
+The padding loop is the detail people miss. JWT segments are base64url *without* padding, and Dart's `base64Url.decode` throws if the length isn't a multiple of four.
+
+On top of that, `SessionUtils` has small guards that each screen calls in `initState`: `checkUserSessionActive` sends signed-out users to login, and `checkUserSessionIsUser` / `checkUserSessionIsAdmin` send each role to its own home. Agents land on the dashboard and victims on their own notes screen. These guards only decide *which screen to show*. Permission checks belong on the API, never in the client.
+
+## 4. Warm the dropdowns in parallel
+
+The incident form has a lot of dropdowns: countries, incident types, flags, poll methods, authors, organisations, victims. On a slow link, opening the form and then fetching seven lists one by one felt broken.
+
+In the newer variant, `FormDropdownCache.warm()` fetches all of them at once, right after login and at startup when a session exists:
+
+```dart title="form_dropdown_cache.dart (trimmed)"
+static Future<void> _safe(Future<dynamic> Function() fn) async {
+  try { await fn(); } catch (_) {}
+}
+
+static Future<void> warm({required bool isVictimUser}) async {
+  await Future.wait([
+    _safe(() => CountrieService().getAll(victim: isVictimUser)),
+    _safe(() => NoticeService().getAllFlags(victim: isVictimUser)),
+    _safe(() => NoticeService().getAllTypes(victim: isVictimUser)),
+    _safe(() => NoticeService().getAllOptions()),
+    // ...agents also get methods, authors, roles, victims, organisations
+  ]);
+}
+```
+
+Two small decisions make this robust. Each future is wrapped in `_safe`, because `Future.wait` fails fast by default and one flaky endpoint shouldn't cancel the other six. And each service checks the cache first (`FormDropdownCache.peek(key)`) and only stores successful responses, so calling `warm()` twice is cheap and a failed list is retried the next time the form needs it. Cache keys include the role, and logout clears the cache, so an agent's lists never leak into a victim's session on a shared phone.
+
+## What I'd tell you before you build one
+
+The pattern has kept reports from being lost. Looking back over the code, though, I'd tighten a few things.
+
+- **Await the draft write.** The insert runs before the API call but isn't awaited, so it's "write-ahead" only as long as SQLite wins the race. That's almost always true, but the guarantee should come from the code, not from timing. `await` the insert, and abort the submit if it fails.
+- **Use parameterized inserts.** The storage helper builds its `INSERT` by interpolating the JSON into a SQL string, which forces a workaround for apostrophes in the payload. In French, apostrophes are everywhere. sqflite's `db.insert(table, {'id': id, 'datas': json})` or `rawInsert` with `?` placeholders handles quoting for you, so the workaround and its matching decode step go away.
+- **Make draft keys stable and unique.** The draft key was meant to be "victim ID plus incident date", but Dart parses it differently:
+
+  ```dart
+  dataKey = victim?.id ?? 0 + timestamp;   // parses as: victim?.id ?? (0 + timestamp)
+  ```
+
+  `??` has *lower* precedence than `+`, so when a victim is selected the key is just their ID. Two drafts for the same victim then collide, and with `INSERT OR IGNORE` the second one is silently dropped. Parenthesize (`(victim?.id ?? 0) + timestamp`), or better, generate a UUID for each draft and send it to the API as an idempotency key so a resubmit can never create a duplicate incident.
+- **Open the database once.** Every storage call runs `openDatabase` again before its query. sqflite caches the handle, so it works, but a single lazily initialized `Database` instance is simpler and makes transactions possible.
+- **Retry in the background.** The startup flush helps, but a periodic background task that retries drafts when connectivity returns would remove the last manual step. The scaffolding for one is already in the codebase, commented out.

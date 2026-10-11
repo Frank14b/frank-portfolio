@@ -1,0 +1,95 @@
+name: Portfolio CD Pipeline
+on:
+  push:
+    branches: [develop, main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy using ssh on Development
+        if: github.ref == 'refs/heads/develop'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          username: ${{ secrets.SSH_USERNAME }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            APP_FOLDER="/home/${{secrets.APP_FOLDER}}"
+            REPO_FOLDER="$APP_FOLDER/${{secrets.DEVELOP_PORTFOLIO_REPO_NAME}}"
+            REPO_URL="https://${{secrets.PAT}}@github.com/frank14b/${{secrets.PORTFOLIO_REPO_NAME}}.git"
+
+            echo "Checking if repository exists: $REPO_FOLDER"
+            if [ ! -d "$REPO_FOLDER/.git" ]; then
+              echo "Repository not found. Cloning..."
+              cd "$APP_FOLDER"
+              git clone "$REPO_URL" "${{secrets.DEVELOP_PORTFOLIO_REPO_NAME}}"
+              cd "$REPO_FOLDER"
+              git config --global --add safe.directory "$REPO_FOLDER"
+              git checkout develop
+            else
+              echo "Repository found. Pulling changes..."
+              cd "$REPO_FOLDER"
+              git config --global --add safe.directory "$REPO_FOLDER"
+              git fetch
+              git stash
+              git checkout develop
+              git pull origin develop
+              git status
+            fi
+
+            # No .env step: the portfolio is a static export with no environment variables.
+
+            cd "$APP_FOLDER"
+            docker-compose -f docker-compose-develop.yml stop ${{secrets.DEVELOP_PORTFOLIO_REPO_NAME}}
+            docker system prune -af
+
+            docker-compose -f docker-compose-develop.yml build --no-cache ${{secrets.DEVELOP_PORTFOLIO_REPO_NAME}}
+
+            docker-compose -f docker-compose-develop.yml up -d ${{secrets.DEVELOP_PORTFOLIO_REPO_NAME}}
+
+      - name: Deploy using ssh on Production
+        if: github.ref == 'refs/heads/main'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          username: ${{ secrets.SSH_USERNAME }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            APP_FOLDER="/home/${{secrets.APP_FOLDER}}"
+            REPO_FOLDER="$APP_FOLDER/${{secrets.PORTFOLIO_REPO_NAME}}"
+            REPO_URL="https://${{secrets.PAT}}@github.com/frank14b/${{secrets.PORTFOLIO_REPO_NAME}}.git"
+
+            echo "Checking if repository exists: $REPO_FOLDER"
+            if [ ! -d "$REPO_FOLDER/.git" ]; then
+              echo "Repository not found. Cloning..."
+              cd "$APP_FOLDER"
+              git clone "$REPO_URL" "${{secrets.PORTFOLIO_REPO_NAME}}"
+              cd "$REPO_FOLDER"
+              git config --global --add safe.directory "$REPO_FOLDER"
+            else
+              echo "Repository found. Pulling changes..."
+              cd "$REPO_FOLDER"
+              git config --global --add safe.directory "$REPO_FOLDER"
+              git fetch
+              git stash
+              git pull origin main
+              git status
+            fi
+
+            # No .env step: the portfolio is a static export with no environment variables.
+
+            cd "$APP_FOLDER"
+            docker-compose -f docker-compose.yml stop ${{secrets.PORTFOLIO_REPO_NAME}}
+            docker system prune -af
+
+            docker-compose -f docker-compose.yml build --no-cache ${{secrets.PORTFOLIO_REPO_NAME}}
+
+            docker-compose -f docker-compose.yml up -d ${{secrets.PORTFOLIO_REPO_NAME}}

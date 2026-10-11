@@ -1,0 +1,211 @@
+---
+title: "A locked-down Electron app with a typed IPC bridge and a transactional local API"
+summary: "An offline farm app needs SQLite, a keychain and native notifications, but the page that renders it should touch none of them. Here's how I split E-Farmer desktop into a sandboxed Angular renderer, a whitelisted preload and a main process that validates every call and runs it in a transaction."
+date: "2026-09-12"
+project: "pro-e-farmer"
+tags: ["Electron", "Angular", "TypeScript", "SQLite", "Security", "Architecture"]
+---
+
+E-Farmer desktop has two storage modes. Cloud users talk to the API over HTTP. Local users keep everything on their own computer: farms, animals, crop cycles, stock and wallets, all in a SQLite file, with no cloud account and no network needed. That mode has to be as solid as the cloud one.
+
+The easy Electron setup turns on `nodeIntegration`, hands the page `require('sqlite')` and lets it go. Then a single XSS bug, compromised dependency or bad link hands a web page your whole disk. I wanted the opposite. The Angular app should be a plain, sandboxed web page. Everything native lives in the main process, behind a small typed door, and every local write is all-or-nothing.
+
+## The flow end to end
+
+<Flow steps={[
+  ["Angular page", "A repository calls localApi.call('wallets.credit', input). The method name and arguments are typed from the shared LocalApi interface."],
+  ["Preload", "window.smartfarm.local.call forwards { method, args } on the single local:call channel. The page never sees ipcRenderer."],
+  ["Main: IPC registrar", "Rejects the call unless it comes from the app's own origin, then runs the channel's runtime validator on the payload."],
+  ["Main: validator", "local:call checks the method exists in the fixed table and that its arguments pass that method's guard."],
+  ["Main: dispatcher", "Builds a LocalContext for the signed-in profile and runs the handler inside BEGIN IMMEDIATE … COMMIT."],
+  ["Handler + ledger", "Writes the stock row, debits or credits the wallet and appends a wallet_transactions row, all in that one transaction."],
+  ["Main to page", "Returns a LocalResult: { ok: true, value } or { ok: false, error: { kind, code, message } }."],
+  ["Angular page", "LocalApiClient rethrows failures as the same ApiError the cloud repositories throw, so a page has one catch for both modes."],
+]} />
+
+## 1. A renderer that is just a web page
+
+The window is created with the settings Electron recommends, and each one is there on purpose:
+
+```ts title="window.ts (trimmed)"
+webPreferences: {
+  preload: options.preloadPath,
+  contextIsolation: true, // preload and page run in separate JS worlds
+  sandbox: true,          // renderer + preload run in Chromium's OS-level sandbox
+  nodeIntegration: false, // no require()/process in the page
+  webSecurity: true,
+},
+```
+
+The window can't navigate away from the app either. `will-navigate` cancels any URL outside the trusted origin and `setWindowOpenHandler` denies every popup, sending https links to the user's browser instead.
+
+In production the Angular bundle isn't loaded from `file://`. A privileged `app://` scheme serves it, which fixes three problems at once. Deep routes like `/dashboard` survive a reload because unknown paths fall back to `index.html`. `fetch` works for the translation files. And the page gets its own origin instead of sharing one with every file on disk. The protocol handler normalizes paths so `..` can't climb out of the bundle folder, and it attaches a strict Content-Security-Policy to every response: scripts from `'self'` only, `object-src 'none'`, `frame-ancestors 'none'`, and `fetch`/XHR limited to the app and its API.
+
+## 2. A preload that exposes functions, not `ipcRenderer`
+
+The preload is the only bridge. It never hands the page `ipcRenderer` itself, only named functions typed against one shared interface:
+
+```ts title="preload.ts (trimmed)"
+function invoke<C extends IpcChannel>(
+  channel: C,
+  ...payload: IpcRequest<C> extends void ? [] : [IpcRequest<C>]
+): Promise<IpcResponse<C>> {
+  return ipcRenderer.invoke(channel, ...payload) as Promise<IpcResponse<C>>;
+}
+
+const bridge: SmartfarmBridge = {
+  secure: {
+    getToken: () => invoke(IpcChannel.SecureGetToken),
+    setToken: (token) => invoke(IpcChannel.SecureSetToken, token),
+    clearToken: () => invoke(IpcChannel.SecureClearToken),
+  },
+  local: {
+    call: (method, ...args) => invoke(IpcChannel.LocalCall, { method, args }) as Promise<never>,
+  },
+  // app, settings, localProfiles, businesses, notifications, updates…
+};
+contextBridge.exposeInMainWorld('smartfarm', bridge);
+```
+
+The contract lives in `libs/shared/src/ipc`: `channels.ts` holds the names, `contract.ts` maps each channel to its request and response types, and `validators.ts` holds the runtime checks. The main process, the preload and the renderer all compile against the same files, so changing a response type breaks every caller at build time. Because `bridge` is annotated as `SmartfarmBridge`, forgetting to expose a function is a compile error too.
+
+Events from main to the page use the same pattern. The preload passes the page only the payload, never the `IpcRendererEvent`, which would expose `sender`.
+
+## 3. Main trusts nothing the page sends
+
+TypeScript types are gone at runtime, so the main process wraps `ipcMain.handle` with two checks that every handler gets for free:
+
+```ts title="ipc/handle.ts"
+ipcMain.handle(channel, async (event, payload: unknown) => {
+  if (!isTrustedOrigin(event.senderFrame?.url)) {
+    throw new Error(`Blocked IPC call to "${channel}" from an untrusted origin`);
+  }
+  const validate = ipcRequestValidators[channel] as (value: unknown) => boolean;
+  if (!validate(payload)) {
+    throw new Error(`Invalid payload for IPC channel "${channel}"`);
+  }
+  return handler(payload as IpcRequest<typeof channel>, event);
+});
+```
+
+The origin check compares the sender frame against `app://smartfarm` (plus the Angular dev server in development). One small gotcha: Node reports `new URL('app://smartfarm/').origin` as the string `"null"`, because only Chromium knows the scheme is standard, so the guard builds `scheme://host` itself.
+
+`ipcRequestValidators` is typed `{ [C in IpcChannel]: Validator<C> }`, so adding a channel without a validator doesn't compile. The validators reject unknown keys, check lengths and only accept positive integer ids.
+
+## 4. One channel for about 100 operations
+
+The early phases used one channel per operation: `customers:list`, `customers:create`, and so on. Each one meant editing five files. Livestock and crops added about 100 operations, so local data moved to a single `local:call` channel carrying `{ method, args }`, with the same guarantees.
+
+Each domain declares its methods as an interface plus one guard per method:
+
+```ts title="wallets.api.ts (trimmed)"
+export interface WalletsLocalApi {
+  'wallets.list'(businessId: number, owner?: WalletOwner): Wallet[];
+  'wallets.credit'(input: WalletCreditInput): Wallet;
+}
+
+export const walletsValidators: LocalApiValidators<WalletsLocalApi> = {
+  'wallets.list': args(is.id(), is.optional(owner)),
+  'wallets.credit': args(
+    is.object<WalletCreditInput>({ walletId: is.id(), amount: is.number({ min: 0.01 }) }),
+  ),
+};
+```
+
+`is.object<T>()` takes one guard per property of `T`, so a type and its runtime check can't drift apart. On the main side, the handler table is checked against the same interface:
+
+```ts title="local-api/registry.ts (trimmed)"
+export const LOCAL_HANDLERS = {
+  ...walletsHandlers,
+  ...animalsHandlers,
+  ...cropCyclesHandlers,
+  // 13 more domains
+} satisfies LocalHandlers<LocalApi>;
+```
+
+`LocalHandlers<T>` maps every method to `(ctx: LocalContext, ...args) => R`. With `satisfies`, a missing handler or a wrong signature is a compile error, and the object keeps its precise inferred type.
+
+## 5. Every call is a transaction, and errors survive IPC
+
+The dispatcher builds a context for the signed-in profile and runs the handler inside a transaction:
+
+```ts title="local-api/dispatch.ts (trimmed)"
+try {
+  const ctx = new LocalContext(db, userId);
+  const value = transaction(db, () => handler(ctx, ...call.args));
+  return { ok: true, value };
+} catch (error) {
+  if (error instanceof LocalRuleError) return failure('RULE', error.code, error.message);
+  if (error instanceof LocalNotFoundError) return failure('NOT_FOUND', 'NOT_FOUND', error.message);
+  if (error instanceof LocalAccessError) return failure('FORBIDDEN', 'FORBIDDEN', error.message);
+  console.error(`[local-api] ${call.method} failed`, error);
+  return failure('INTERNAL', 'INTERNAL', error instanceof Error ? error.message : String(error));
+}
+```
+
+Handlers never take a user id from the page. `LocalContext` carries the profile id, and its `member()` and `owned()` helpers refuse any farm or row that doesn't belong to that profile.
+
+Errors come back as data on purpose. If you throw a custom error class in `ipcMain.handle`, the renderer gets a generic `Error` with your message mashed into a string, and the class and its fields are gone. A `LocalResult` keeps the `kind` and a stable `code` like `WALLET_BALANCE_TOO_LOW`, which the renderer turns into a translated message.
+
+`transaction()` in `db/database.ts` is short:
+
+```ts title="db/database.ts (trimmed)"
+export function transaction<T>(db: Database, work: () => T): T {
+  if (db.isTransaction) {
+    const name = `sp_${++savepointCounter}`;
+    db.exec(`SAVEPOINT ${name}`);
+    try { const r = work(); db.exec(`RELEASE ${name}`); return r; }
+    catch (e) { db.exec(`ROLLBACK TO ${name}; RELEASE ${name}`); throw e; }
+  }
+  db.exec('BEGIN IMMEDIATE');
+  try { const r = work(); db.exec('COMMIT'); return r; }
+  catch (e) { db.exec('ROLLBACK'); throw e; }
+}
+```
+
+`BEGIN IMMEDIATE` takes the write lock up front, so a transaction never starts as a reader and then fails to upgrade halfway through. Nested calls become savepoints, so a repository method can call another without caring whether it's already inside a transaction.
+
+<Callout tone="warn">
+The whole transaction story only works because `node:sqlite` is **synchronous**. If a handler could `await` in the middle, another call could interleave its statements into the open transaction. Keep handlers sync, and keep network calls out of them.
+</Callout>
+
+## 6. Money goes through one ledger
+
+Buying feed, medication, animals or crop inputs debits a wallet, and selling eggs or harvest credits one. All of it goes through `local-api/ledger.ts`, the only code that changes a balance. `debit()` and `credit()` update the balance and append a `wallet_transactions` row that links back to whatever caused it (`foodTransactionId`, `harvestTransactionId` and so on). No handler updates or deletes those rows, so the history is append-only. A `DEBIT` wallet can't go below zero; it throws `LocalRuleError` with `WALLET_BALANCE_TOO_LOW`. Because the dispatcher already holds a transaction, the stock write and the money write commit together or not at all.
+
+## 7. Local or cloud, chosen once
+
+The mobile app has about 164 `if (mode === 'local') … else apiCall()` branches inside its hooks. On desktop, each feature defines one abstract repository, and Angular's DI picks the implementation once:
+
+```ts title="crop-cycles.repository.ts (trimmed)"
+@Service({
+  factory: () =>
+    inject(StorageModeService).isLocal()
+      ? inject(LocalCropCyclesRepository)
+      : inject(CloudCropCyclesRepository),
+})
+export abstract class CropCyclesRepository {
+  abstract list(businessId: string): Promise<CropCycleDto[]>;
+  abstract create(businessId: string, input: CropCycleCreateInput): Promise<CropCycleDto>;
+}
+```
+
+Pages and stores only inject `CropCyclesRepository`. Since the factory runs once, switching storage mode saves the setting and reloads the window. The main process and its database keep running, so the reload is quick.
+
+## 8. Token vault and why `node:sqlite`
+
+The cloud auth token is encrypted with Electron's `safeStorage` (DPAPI on Windows, Keychain on macOS, libsecret on Linux) and written with mode `0o600`. If the OS can't encrypt, for example on Linux without a keyring, the token stays in memory only and the user signs in again next launch. Writing a readable token to disk is never the fallback.
+
+I first planned to use better-sqlite3. I switched to Node's built-in `node:sqlite` because Electron 44 ships Node 24. There's no native module to rebuild for Electron's ABI, no `.node` files to unpack from the asar, and the same module runs in Vitest and in the app. The API is synchronous and close to better-sqlite3's. I checked it in development, in tests and in a packaged build before committing to it.
+
+<Callout tone="tip">
+Build the IPC layer so the *compiler* does the bookkeeping. A channel without a validator, a preload function missing from the bridge, a domain method without a handler: each one is a build error, not a code-review comment.
+</Callout>
+
+## What I'd tell you before you build one
+
+- **Treat the renderer as untrusted, even offline.** Local mode still validates every payload and scopes every query to the signed-in profile. A test proves one profile can't read another's farm.
+- **Move to a method table early.** One channel per operation is fine for ten operations and painful for a hundred. A typed `{ method, args }` channel with per-method guards keeps the same guarantees with far less ceremony.
+- **Send errors back as data.** A `{ ok, value | error }` result is the simplest way to keep error codes across the process boundary.
+- **Default to a transaction.** Wrapping *every* call, reads included, costs almost nothing in SQLite and removes a whole class of half-written data.
+- **What I'd change:** `LocalFailure.kind` is a fixed union, but the codes inside `RULE` are free strings. I'd make them a shared union type too, so the renderer's translation keys are checked at compile time like everything else.

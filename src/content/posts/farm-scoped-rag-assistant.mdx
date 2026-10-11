@@ -1,0 +1,178 @@
+---
+title: "A farm-scoped RAG assistant: tenant filters, capped retrieval and prompts that refuse to guess"
+summary: "A farming assistant that answers from the wrong farm's records, or from the whole corpus, is worse than no assistant. Here's how Sora in Pro E-Farmer routes questions through canned actions, intent detection and a multi-tenant RAG service that only sees the farmer's own data."
+date: "2026-08-14"
+project: "pro-e-farmer"
+tags: ["RAG", "ChromaDB", "NestJS", "Django", "LLM", "Multi-tenancy"]
+---
+
+Pro E-Farmer has an assistant called Sora. A farmer opens the chat and asks things like "how is my tomato?" or "how many birds do I have?", in English or French. The answer has to come from *that farmer's* records: their crop cycles, their animals, their operations. Not another farm's, and not the marketing copy for the app.
+
+The first version was a single RAG call with the question, a vector search and an LLM. It worked in demos and failed in a very specific way in production: a crop question would come back sounding like a livestock farm. The retrieval was technically "relevant", but it was pulling overview text and global highlights instead of the crop-cycle records that actually held the answer.
+
+This post walks through how Sora is built now: three answer layers in NestJS, then a Django service that does tenant-filtered, capped retrieval and a prompt that would rather say "that section is missing" than invent a harvest date.
+
+## The flow end to end
+
+<Flow steps={[
+  ["Mobile app", "The farmer sends a message; the app passes the text, the locale and the active farm to the Nest API."],
+  ["Nest use case", "A tapped suggestion returns canned, translated copy. No model involved."],
+  ["Wit.ai", "Free text goes to intent classification. A top intent at 0.95 confidence or higher maps to the same canned actions."],
+  ["Nest use case", "Everything else becomes one call to the Django AI service with the question, the business ids and the locale."],
+  ["Embedder", "all-MiniLM-L6-v2 embeds the question after the language wrapper is stripped off."],
+  ["Chroma", "Capped candidate queries, all filtered by businessId $in the farmer's businesses. Crop questions pull crop-cycle sections."],
+  ["RAG use case", "Packs the best sections under MAX_CONTEXT_CHARS and builds a strict grounding prompt with a language directive."],
+  ["LLM", "gemini-2.5-flash at temperature 0.05 by default, or a local Ollama model when the config says so."],
+]} />
+
+## 1. Cheap answers first
+
+Most chat messages in a farm app aren't open questions. They're "I want to add an animal" or "record an egg sale". Sending those to an LLM is slow, costs money and gives you a paragraph when the user wanted a button.
+
+So `CreateChatBotUseCase` tries three layers in order:
+
+```ts title="create-chatbot.usecase.ts (trimmed)"
+if (data.suggestionId) {
+  botResponse = this.handleSuggestion(data.suggestionId);   // canned copy + deep link
+} else {
+  botResponse = await this.handleCustomQuery(data.query);  // Wit.ai intent
+  if (botResponse.status === false) {
+    botResponse = await this.handleOnlineSearchQuery(       // RAG
+      data.query, data.userId, data.businessId ?? null,
+    );
+  }
+}
+
+// inside handleCustomQuery
+const intent = response.data?.intents?.[0];
+if (!intent || intent.confidence < 0.95) return errorResponse;
+return this.handleSuggestion(intent.name, missingAction);
+```
+
+The suggestion map holds the response text and an in-app link (for example to the animal form), and the text is pulled from a translation file for the user's locale. Wit.ai intents are named after the same keys, so a confident intent like `wit_create_animal` lands on exactly the same canned action as tapping the chip.
+
+The 0.95 threshold is deliberately high. A wrong deep link is more annoying than a slower RAG answer, so anything Wit.ai isn't sure about falls through. So does an intent Wit.ai recognizes but the map doesn't have an action for yet.
+
+## 2. Tenant isolation is a metadata filter, not a prompt instruction
+
+The Django service (`smartfarm-ai-app`) keeps one Chroma collection for everything: a global app description plus per-business records. Every business chunk is indexed with a `businessId` in its metadata, and every business query carries a `where` filter:
+
+```python title="rag_usecase.py (trimmed)"
+def retrieve(self, query, business_id, k=10):
+    question = retrieval_question(query)          # drop the language wrapper
+    k = min(max(int(k or 1), 1), MAX_BUSINESS_CANDIDATES)
+    q_emb = self.embedder.embed([question])[0]
+    ids = self._business_ids(business_id)
+    where_biz = {"businessId": {"$in": ids}} if ids else None
+
+    if where_biz:
+        business_hits = self._query_hits(q_emb, k=candidate_k, where=where_biz)
+        cycle_hits = self._get_hits(
+            limit=MAX_CYCLE_CANDIDATES,
+            where=where_biz,
+            where_document={"$contains": "Crop Cycle"},
+        )
+        # ...plus needle lookups and a recordKind == "crop_cycle" query
+```
+
+The filter is applied inside the vector store, so another farm's chunks are never candidates in the first place. Telling the model "only use this farm's data" in the prompt is not isolation; the filter is.
+
+`retrieval_question` matters more than it looks. The language directive is an `[Important: You must answer the user only in ... fr-FR ...]` prefix that Nest prepends on other AI calls, so a question can arrive with it already attached. Embed that and every French question lands near every other French question. The helper strips the prefix (and a leading "User question:") with a regex before embedding.
+
+## 3. Capped candidates, never a collection scan
+
+Every read goes through two small helpers that clamp their limits:
+
+```python title="rag_usecase.py"
+def _query_hits(self, q_emb, k: int, **kwargs):
+    """Query a small candidate set. Never scans the collection."""
+    k = max(1, min(int(k), MAX_BUSINESS_CANDIDATES))
+    for size in (k, 2, 1):            # retry smaller if Chroma refuses
+        try:
+            return self._result_to_hits(self.chroma.query(q_emb, k=size, **kwargs))
+        except Exception:
+            continue
+    return []
+```
+
+The caps live in one place: at most 8 business candidates, 8 cycle candidates, 8 prompt chunks, and a 500-character overview. The shrinking retry is defensive: if a filtered query errors at the requested size, it tries 2, then 1, because a thin answer beats an empty one.
+
+## 4. Crop "needles", including French aliases
+
+Crop types are stored as English enum values like `tomato` or `maize`. Farmers type "tomates", "maïs" or "manioc". Embeddings from a small English model don't reliably bridge that, so there's a plain lookup table:
+
+```python title="crop_record_chunks.py (trimmed)"
+_CROP_ALIASES = (
+    ("tomato", ("tomato", "tomate", "tomates", "tomatoes")),
+    ("maize", ("maize", "corn", "mais", "maïs")),
+    ("cassava", ("cassava", "manioc")),
+    ("groundnut", ("groundnut", "peanut", "arachide")),
+    # ...13 crops in total
+)
+
+def stored_crop_needles(question: str) -> List[str]:
+    """English crop tokens as they are stored on the cycle record."""
+    q = (question or "").lower()
+    return [name for name, aliases in _CROP_ALIASES
+            if any(alias in q for alias in aliases)]
+```
+
+The needles become `$contains` document filters (still scoped by `businessId`), and the alias list filters the merged hits afterwards. Ask about tomatoes and the plantain cycle is dropped before it ever reaches the prompt. A second list of hints ("récolte", "parcelle", "stade", "harvest", "plot"…) decides whether the question is about farm records at all.
+
+<Callout tone="warn">
+Semantic search is not keyword search. If your users write in one language and your records store enum values in another, a 20-line alias table will beat a better embedding model, and you can test it.
+</Callout>
+
+## 5. Pack sections, not documents
+
+A crop-cycle record can be long: plots, phases, up to 30 operations, inputs, treatments, harvest movements, observations. `pack_crop_context` splits each cycle into sections, repeats a short banner (cycle name, status, current stage) on each one, and picks them in a fixed priority order: identity, plots, phases, operations, inputs, treatments, decisions, observations, harvest. Sections are clipped to 700 characters, or 450 when several cycles compete, and packing stops at the character budget.
+
+That ordering means the current stage is never pushed out by a long list of irrigation operations. When nothing crop-related matches, the fallback keeps the business's nearest notes plus *at most one* app-description chunk, so marketing copy can't fill the prompt.
+
+## 6. A prompt that refuses to guess
+
+`build_prompt` enforces `MAX_CONTEXT_CHARS` (3,500 by default) one more time, then wraps the context in rules:
+
+```python title="rag_usecase.py (prompt excerpt)"
+REQUIREMENTS:
+- Use only facts written in RETRIEVAL CONTEXT. Do not invent quantities,
+  dates, stages, or other agronomic numbers.
+- A sentence that says monitoring covers stages, plots, operations, treatments,
+  harvests, or pest decisions is not data. Do not describe the crop from that sentence.
+- Do not say a crop or farm is doing well ... unless the context states a specific fact.
+- When the user asks about a crop, report the current stage, plots, operations, ...
+  If a section is absent, say that it is missing.
+```
+
+The second rule exists because of a real failure. The generated overview contains a line saying that monitoring covers stages, plots and so on. The model read that as evidence and happily told farmers their crop was "well managed". Now the prompt names that sentence as product description, not data.
+
+The language directive goes in the same prompt, and the model call is a config switch:
+
+```python title="rag_usecase.py"
+if USE_GEMINI_API:                    # default: true
+    answer = await self.generate_response(prompt, chat_id, lang=lang)
+    return answer, hits
+answer = self.llm.chat(prompt)        # Ollama, LLM_MODEL defaults to llama3
+return answer, hits
+```
+
+Gemini (`gemini-2.5-flash`, temperature 0.05) is the default. Setting `USE_GEMINI_API=false` routes the same prompt to a local Ollama model. It's a deploy-time switch, not an automatic failover; I wanted the option to run fully local without pretending the two models behave identically.
+
+## The lesson that changed the design
+
+I wrote the post-mortem down in a planning doc: a crop question retrieved the business overview, the crop names, that "monitoring covers…" sentence and one brochure chunk, and missed the `### Crop Cycle` sections that held the actual stage and operations. On top of that, the knowledge builder writes animal records and crop records for every business, and the global description always carries livestock totals. **Whole-corpus prompting made crop answers sound like livestock.**
+
+The capped, crop-aware retrieval above is the fix for today. The next step is planned, not built: an agentic version where Nest runs a short tool loop (get the business profile, then only the crop tools or only the animal tools that business type allows, then fetch the one cycle the question names) with a hard cap of four steps. The idea is to stop retrieving text that *might* be relevant and start fetching the exact record that *is*.
+
+<Callout tone="tip">
+If your corpus mixes entity types, route by type before you retrieve. A metadata filter on "what kind of business is this" removes a whole class of wrong answers that no prompt rule can fully fix.
+</Callout>
+
+## What I'd tell you before you build one
+
+- **Put isolation in the query.** A `$in` filter on tenant ID in the vector store is the boundary. Prompts are for tone, not security.
+- **Cap everything.** Candidate counts, sections per cycle, characters per section, total context. The prompt should never grow with the size of a farm.
+- **Don't keep chat sessions in worker memory.** Gemini chat objects live in a dict on the Django process, and the service runs under gunicorn with two workers. Consecutive messages can land on different workers, and nothing evicts old sessions. I'd move conversation state to the Nest side (it already stores conversations in Postgres), send the last few turns explicitly, and make the AI service stateless.
+- **Budget memory for the embedder.** `all-MiniLM-L6-v2` is small, but it's loaded lazily in *every* worker process, next to a Chroma client. Workers have been OOM-killed while loading it. One embedding process (or a dedicated embedding endpoint) shared by all workers is the cleaner shape.
+- **Make "missing" a valid answer.** Farmers trust "no operations are recorded for this cycle" far more than a confident paragraph. Build the prompt so saying that is the easy path for the model.
+- **Keep the cheap layers.** Canned suggestions and a high-confidence intent classifier handle the "take me to the form" traffic in milliseconds, and leave the LLM for questions that need it.

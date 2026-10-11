@@ -1,0 +1,186 @@
+---
+title: "1:1 telemedicine video calls on mobile networks: PeerJS, shared TURN credentials and socket.io ringing"
+summary: "Peer-to-peer video between two phones on African mobile carriers fails without a relay, and both sides have to agree on which relay. This retrospective walks through how HelloDocteur's Ionic app rang, connected and logged doctor consultations, and what I'd change today."
+date: "2026-04-18"
+project: "hellodocteur"
+tags: ["WebRTC", "PeerJS", "TURN", "Socket.io", "Ionic", "Retrospective"]
+---
+
+In 2020 and 2021 I built the mobile app for HelloDocteur, where patients consult licensed doctors by chat, audio or video. The consultation call was the core feature, and it had to work between two Android phones that were usually on mobile data, often behind carrier-grade NAT.
+
+On those networks a STUN server alone isn't enough. STUN tells each phone its public address, but when both sides sit behind symmetric NATs the direct path never opens and the call connects with no media. You need a **TURN relay**, and TURN needs credentials. Those credentials expire, and the two peers have to use compatible ICE servers or the negotiation quietly stalls.
+
+This post is a retrospective: how the call flow worked in the Ionic 5 / Angular app, the parts that held up, and the parts I'd build differently now.
+
+## The flow end to end
+
+<Flow steps={[
+  ["Caller app", "Opens the call screen and fetches a fresh set of time-limited STUN/TURN credentials from the credentials service."],
+  ["API", "Stores the credential set, then creates the call record with the same credentials attached as JSON."],
+  ["Caller app", "Creates its PeerJS peer with a deterministic ID, emits user-start-call with the call record ID over socket.io and starts the ringback tone."],
+  ["Callee app", "Receives incoming-call, loads the call record, copies its credentials into local storage and shows a ringing toast with Answer and Decline."],
+  ["Callee app", "On Answer, opens the call screen, creates its own peer and, after a short delay, places the PeerJS call to the caller's derived peer ID."],
+  ["Caller app", "Its peer's call handler answers with the local camera and mic stream. Both sides attach the remote stream to a video element."],
+  ["Socket server", "Relays the start-counter event to both phones. Each marks the call record as connected and starts the on-screen timer."],
+  ["Either app", "Hang-up emits user-stop-call. Both sides write the duration to the call record, destroy the peer and stop their tracks."],
+]} />
+
+## 1. One credential set per call
+
+The credentials came from a small Express service that calls Twilio's Network Traversal Service and returns the `iceServers` array. I didn't write that service; it's a fork of an open-source Twilio STUN/TURN proxy, which is all it needs to be.
+
+The part I did design is what happens next. Only the caller fetches credentials. They get attached to the **call record**, so when the callee is notified, it reads that record and uses exactly the same relay servers and username/credential pair:
+
+```ts title="app.component.ts (trimmed)"
+this.socket.fromEvent('incoming-call').subscribe((data) => {
+  if (data[1] == this.postPvd.getLocalData('user_id')) {
+    this.videocallCredential(data[2], data[0], 'video'); // data[2] = call record id
+  }
+});
+
+videocallCredential(callId, callerId, type) {
+  this.postPvd.postData(/* query for call record callId */).subscribe((result) => {
+    if (result.success) {
+      // both peers now build ICE config from the same credential set
+      this.postPvd.setLocalData('curentCredential', JSON.parse(result.data[0].credential));
+      type == 'video' ? this.getUserInfos(callerId) : this.getUserInfos2(callerId); // ringing toast
+    }
+  });
+}
+```
+
+There's also a recovery path at app start: `videocallCheck()` looks for the latest unanswered call addressed to this user and replays the same credential load and ringing toast. That covers the case where the app is opened from a call notification instead of a live socket event.
+
+The PeerJS options then turn the stored row into ICE servers: one STUN URL and three TURN URLs sharing a single username and credential.
+
+```ts title="webrtc.service.ts (trimmed)"
+config: {
+  iceServers: [
+    { urls: cred.sturn },
+    { urls: cred.turn1, username: cred.username, credential: cred.credential },
+    { urls: cred.turn2, username: cred.username, credential: cred.credential },
+    { urls: cred.turn3, username: cred.username, credential: cred.credential },
+  ],
+},
+```
+
+## 2. Signalling: socket.io for the human part, PeerJS for the media part
+
+I split signalling into two layers. PeerJS, with its own PeerServer, handled SDP offers, answers and ICE candidates. socket.io handled everything a person sees: ringing, accept, decline, "connected", hang-up.
+
+That split kept the WebRTC code small. The call screen only had to know a few events: `user-start-call` to ring, `user-initiate-call` when the callee accepts, `user-start-call-counter` once media flows, and `user-stop-call` to hang up. The caller plays a ringback tone every four seconds and gives up after 60 seconds with an "unavailable" message.
+
+Peer IDs are **deterministic**. Each one is a hash derived from the user's ID and a per-user call identifier, so the callee can compute the caller's peer ID locally from the profile it just fetched. Nothing has to be exchanged to find the other peer:
+
+```ts title="inboxcall.page.ts (paraphrased)"
+this.userId    = derivePeerId(me.use_id, me.user.callid);         // my peer
+this.partnerId = derivePeerId(partner.id, partner.callid);        // the peer I'll dial
+```
+
+## 3. Capturing media with sensible constraints
+
+Bandwidth on mobile data was the constraint that mattered most. Audio was asked for as 16 kHz mono with echo cancellation, which is plenty for a voice consultation. Video asked for 720p ideal, with bounds so a low-end phone wouldn't fall back to something unusable:
+
+```ts title="webrtc.service.ts"
+navigator.getUserMedia({
+  audio: { channelCount: 1, sampleRate: 16000, sampleSize: 16, echoCancellation: true },
+  video: {
+    facingMode: 'user',
+    width:  { min: 1024, ideal: 1280, max: 1920 },
+    height: { min: 576,  ideal: 720,  max: 1080 },
+  },
+}, (stream) => this.handleSuccess(stream), (err) => this.handleError(err));
+```
+
+Audio-only calls (`audiocall.page.ts`) reuse the same service with `{ audio: true, video: false }`, so the two call types share every line of peer and hang-up logic.
+
+## 4. Call and answer
+
+Once both peers exist, the PeerJS part is short. Whoever dials passes the local stream; whoever receives answers with theirs:
+
+```ts title="webrtc.service.ts"
+call(partnerId: string) {
+  const call = this.peer.call(partnerId, this.myStream);
+  call.on('stream', (stream) => {
+    this.partnerEl.srcObject = stream;
+    this.currentPeer = call.peerConnection;   // kept for replaceTrack later
+  });
+}
+
+wait() {                                       // registered on peer 'open'
+  this.peer.on('call', (call) => {
+    call.answer(this.myStream);
+    call.on('stream', (stream) => (this.partnerEl.srcObject = stream));
+    this.currentPeer = call.peerConnection;
+  });
+}
+```
+
+One detail is worth noticing: the **callee dials the caller**. The caller's peer is already open and waiting when the callee accepts, so the side that is ready second starts the media session. That avoids an offer arriving at a peer that doesn't exist yet.
+
+### Recovering from "ID is taken"
+
+PeerServer refuses a second connection with the same ID. If a previous call didn't clean up, for example after the app was killed mid-call, the stale ID could still be registered. The service matches that error, increments the user's call identifier through the API, saves the updated profile and creates the peer again:
+
+```ts title="webrtc.service.ts (trimmed)"
+this.peer.on('error', (err) => {
+  if (err == 'Error: ID "' + userId + '" is taken') this.updateCallId();
+});
+
+updateCallId() {
+  const body = { id: session.use_id, callid: parseInt(session.user.callid) + 1 };
+  this.postPvd.postData(body, /* profile update */).subscribe(
+    (res) => res.success ? (saveSession(res.data), this.createPeer(this.userID))
+                         : this.updateCallId(),
+    () => this.updateCallId(),
+  );
+}
+```
+
+Because the call identifier is part of the derived peer ID, bumping it gives the user a fresh ID that the other side can still compute from the profile.
+
+<Callout tone="warn">
+Matching on an error *message* string is brittle: a library upgrade that rewords it silently disables your recovery. PeerJS also exposes `err.type === 'unavailable-id'`, and that's what I'd check today. The recovery also had a subtle bug: the retry re-created the peer with the ID already held in memory, so the bumped identifier only took effect on the next call screen.
+</Callout>
+
+## 5. Flipping the camera without renegotiating
+
+Switching between front and back cameras mid-consultation was a real need. Doctors asked patients to show a rash or a swelling. Tearing down and re-dialing the call would take seconds and sometimes fail, so instead I swapped the outgoing video track in place with `RTCRtpSender.replaceTrack`:
+
+```ts title="webrtc.service.ts (trimmed)"
+changePeerCamera(mode = 'rear') {
+  this.stopVideoOnly(this.myStream);                    // release the current camera
+  navigator.getUserMedia({
+    audio: true,
+    video: { facingMode: mode == 'rear' ? { exact: 'environment' } : 'user', /* same bounds */ },
+  }, (stream) => {
+    this.handleSuccess(stream);                         // update local preview
+    const track = stream.getVideoTracks()[0];
+    const sender = this.currentPeer.getSenders().find((s) => s.track.kind === track.kind);
+    sender.replaceTrack(track);                         // no new offer/answer
+  });
+}
+```
+
+`replaceTrack` doesn't need a new offer and answer as long as the new track fits the negotiated parameters, and a different camera with the same constraints does. The call stays up while the camera changes.
+
+<Callout tone="tip">
+Stop the old video track *before* opening the other camera. Many Android devices can't hold both cameras open at once, and `getUserMedia` fails with a hard-to-diagnose error if you skip this.
+</Callout>
+
+## 6. Logging the consultation
+
+Every call is a database record: created by the caller with state 0, set to state 1 when the counter event arrives on both phones, and set to state 2 with a duration on hang-up. The on-screen timer is a one-second `setInterval` that rolls seconds into minutes and hours. Whichever side hangs up, or receives `stopping-call`, writes the formatted duration before destroying the peer. Completed calls with a duration are what the doctor-side screen lists as past consultations with a patient.
+
+## What I'd do differently today
+
+The architecture held up: a shared credential set per call, a split between human signalling and media signalling, deterministic peer IDs and track replacement for the camera. Several implementation choices show their 2020 age, though.
+
+- **Use `navigator.mediaDevices.getUserMedia`.** The callback-style `navigator.getUserMedia` was already deprecated. The promise version composes with `async/await`, makes error handling explicit, and lets you check `OverconstrainedError` by name instead of guessing.
+- **Back off instead of recursing.** Both the credential fetch and the ID-bump retried by calling themselves immediately on failure. On a dead connection that's a tight loop that drains the battery. I'd use exponential backoff with a cap and a visible "reconnecting" state.
+- **Replace the timer race with a ready handshake.** The callee waited a fixed two seconds before dialing and assumed the caller's peer was open by then. On a slow network it sometimes wasn't. Today I'd have the caller emit an explicit `peer-ready` event once its peer fires `open`, and dial only after receiving it.
+- **Build ICE config per call.** The PeerJS options were assembled in the singleton service's constructor, which runs once per app session. I'd build them right before creating the peer, from the credentials attached to *that* call.
+- **Issue per-user TURN credentials with a short TTL.** I'd mint credentials per participant, scoped to the call and expiring within minutes, using the TURN REST convention of a time-stamped username plus an HMAC.
+- **Mute with `track.enabled = false`.** The mute button sent a socket message telling the other phone to mute its player, so the audio still traveled. Disabling the local track stops sending, saves bandwidth and doesn't depend on the other side honoring a message.
+- **Record timestamps, not formatted strings.** The duration was a client-built `HH:MM:SS` string. Storing server-side start and end times is more accurate and much easier to query.
+- **Adopt perfect negotiation.** PeerJS hid offer/answer for a 1:1 call, which was the right trade-off then. For anything beyond that, such as renegotiating to add screen share or recovering from network changes with an ICE restart, I'd use the standard perfect-negotiation pattern on a raw `RTCPeerConnection`, with a polite and an impolite peer, so glare resolves itself.

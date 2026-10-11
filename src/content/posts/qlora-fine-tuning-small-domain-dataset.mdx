@@ -1,0 +1,161 @@
+---
+title: "QLoRA on a 133-sample domain dataset: what fine-tuning Phi-3-mini taught me about when not to"
+summary: "I tried fine-tuning Phi-3-mini-4k-instruct with QLoRA so Pro E-Farmer's assistant could run on a small local model. Here's the setup, the bugs a small dataset hides, and why RAG is what's live while the adapter stays an experiment."
+date: "2026-07-20"
+project: "pro-e-farmer"
+tags: ["LLM", "Fine-tuning", "QLoRA", "PEFT", "Python"]
+---
+
+Pro E-Farmer's assistant, Sora, answers from farm records through RAG, with Gemini as the default model and a local Ollama model as an option. I wanted to know whether a small open model, fine-tuned on our own Q&A, could carry more of that load: speak in Sora's voice, know the app's features, and run on hardware I control.
+
+So I set up a QLoRA run on `microsoft/Phi-3-mini-4k-instruct` with a hand-written chat dataset. This post is an honest write-up of that experiment. **The adapter is not serving production traffic.** RAG is what's live. But the setup is reusable, and the mistakes are the useful part.
+
+## The flow end to end
+
+<Flow steps={[
+  ["Dataset", "133 hand-written chat samples in a messages format: user question, assistant answer."],
+  ["Tokenizer", "Phi-3's chat template turns each conversation into one training string, plus an EOS token."],
+  ["Base model", "Phi-3-mini-4k-instruct loads in 4-bit NF4 with double quantization; compute in bfloat16."],
+  ["PEFT", "LoRA adapters (r=16, alpha=32) attach to the listed projection layers; the base stays frozen."],
+  ["TRL", "SFTTrainer runs 3 epochs, effective batch size 16, paged 8-bit AdamW, learning rate 2e-4."],
+  ["Output", "Only the adapter weights and tokenizer are saved: megabytes, not a full model."],
+  ["Not done yet", "Merge, convert to GGUF, quantize, serve via Ollama, evaluate against RAG."],
+]} />
+
+## 1. The dataset: small, chat-shaped, and stricter than it looks
+
+The training file is `pro_e_farmer_tuning.jsonl`, 133 conversations. Each one is a short user and assistant exchange about the app or about livestock basics:
+
+```json title="pro_e_farmer_tuning.jsonl (one sample)"
+{"messages": [
+  {"role": "user", "content": "What is the core mission of the Pro E-Farmer app?"},
+  {"role": "assistant", "content": "The app's mission is to **empower farmers** with an integrated digital ecosystem ..."}
+]}
+```
+
+That sample shows two problems I only found when auditing the file for this post.
+
+First, **it isn't JSONL**. Every object spans four lines. JSON Lines means exactly one JSON value per line, and the `datasets` JSON loader is built around that. Pretty-printing is a habit from editing by hand, and it breaks the format.
+
+Second, **the keys aren't consistent**. 79 of the 133 samples use `role` on both turns. The other 54 use `role_id` on at least one turn, some on both. A chat template indexes `message['role']`, so those samples fail outright or get silently dropped, depending on your pipeline. That's 40% of an already small dataset.
+
+<Callout tone="warn">
+Validate a fine-tuning dataset with code, not with your eyes. A ten-line script that checks one object per line, the expected keys, allowed role values and alternating turns would have caught both issues before a GPU spent a second on them.
+</Callout>
+
+## 2. Format with the model's own chat template
+
+Each sample becomes one string using the tokenizer's chat template, with EOS appended so the model learns where an answer ends:
+
+```python title="finetune.py"
+tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
+
+def _format_sample(sample):
+    messages = sample.get("messages")
+    if not messages:
+        raise ValueError("Each training sample must contain a 'messages' list of chat turns.")
+    formatted = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False,
+    )
+    sample["text"] = formatted + tokenizer.eos_token
+    return sample
+```
+
+`apply_chat_template` matters because every instruct model has its own turn markers. Phi-3 uses different tokens than Llama 3. An older data-prep script in the same repo still says "Llama 3 template" in its comments; it's harmless only because it calls the tokenizer's template rather than hand-writing one. Always template with the tokenizer of the model you're actually training.
+
+One thing to check if you copy this: when pad and EOS share a token ID, some collators mask every pad position out of the loss, and that includes the EOS you just appended. Then the model never learns to stop. Inspect a batch's labels once before a long run.
+
+## 3. QLoRA: 4-bit base, small trainable adapters
+
+QLoRA keeps the base model frozen in 4-bit and trains low-rank adapters on top. That's what makes a 3.8B-parameter model trainable on one consumer GPU:
+
+```python title="finetune.py"
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",            # NormalFloat4, built for normally distributed weights
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_use_double_quant=True,       # quantize the quantization constants too
+)
+
+peft_config = LoraConfig(
+    r=16, lora_alpha=32, lora_dropout=0.05,
+    bias="none", task_type="CAUSAL_LM",
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "up_proj", "down_proj", "gate_proj"],
+)
+```
+
+The intent was the usual QLoRA recipe: adapt all attention *and* MLP projections, not only `q_proj` and `v_proj`, to give the adapter more room to change style, with `alpha = 2 × r` as a starting point.
+
+That list has a bug I didn't catch at the time. The module names are Llama-style. Phi-3 fuses its projections: attention uses a single `qkv_proj`, and the MLP uses `gate_up_proj` plus `down_proj`. PEFT only raises an error when *none* of the target names match, so this config quietly adapts `o_proj` and `down_proj` and nothing else. For Phi-3 the list should be `["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]`. Once the trainer has wrapped the model, call `trainer.model.print_trainable_parameters()` and check that the number matches what you expected.
+
+The script refuses to run without CUDA. It probes for Intel's PyTorch extension (IPEX) first, but the 4-bit `bitsandbytes` path I used is built around NVIDIA GPUs, so a CUDA machine was the practical choice.
+
+## 4. Training settings, and a version trap
+
+```python title="finetune.py (as committed)"
+training_arguments = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=4,        # effective batch of 16
+    optim="paged_adamw_8bit",
+    learning_rate=2e-4,
+    num_train_epochs=3,
+    fp16=True,
+    save_strategy="epoch",
+)
+trainer = SFTTrainer(
+    model=model, train_dataset=formatted_dataset, peft_config=peft_config,
+    dataset_text_field="text", args=training_arguments,
+    tokenizer=tokenizer, max_seq_length=1024, packing=False,
+)
+```
+
+With 133 samples and an effective batch of 16, that's about 9 optimizer steps per epoch and roughly 27 in total. Small enough that `logging_steps=10` gives you only a couple of loss readings per run.
+
+There are two bugs in that block.
+
+**Mixed precision is inconsistent.** The model loads with `torch_dtype=torch.bfloat16` and the 4-bit compute dtype is bfloat16, but training is told `fp16=True`. Pick one. On Ampere or newer GPUs, use `bf16=True` everywhere; on older cards, use float16 for the compute dtype as well and keep `fp16=True`.
+
+**The TRL API moved.** `requirements.txt` pins `trl==0.23.1` (with `transformers==4.57.0`, `peft==0.17.1`, `bitsandbytes==0.48.1`, `torch==2.8.0`). In recent TRL versions, dataset and sequence options live on `SFTConfig`, the tokenizer argument is `processing_class`, and `max_seq_length` became `max_length`. The call above is written for an older TRL and won't construct against the pinned version. The shape it needs is:
+
+```python title="finetune.py (shape for current TRL)"
+from trl import SFTConfig, SFTTrainer
+
+args = SFTConfig(
+    output_dir=OUTPUT_DIR,
+    per_device_train_batch_size=4, gradient_accumulation_steps=4,
+    optim="paged_adamw_8bit", learning_rate=2e-4, num_train_epochs=3,
+    bf16=True, save_strategy="epoch",
+    dataset_text_field="text", max_length=1024, packing=False,
+)
+trainer = SFTTrainer(model=model, args=args, train_dataset=formatted_dataset,
+                     peft_config=peft_config, processing_class=tokenizer)
+```
+
+Current TRL can also take the `messages` dataset directly and apply the chat template itself. If you go that way, drop the manual formatting, and check whether your version appends EOS for you so you don't end up with two.
+
+<Callout tone="tip">
+Pin exact versions for training code, and read the changelog of TRL in particular before upgrading. Most "it worked in the tutorial" failures in this space are a tutorial written against a different release.
+</Callout>
+
+## RAG or fine-tuning? Both, for different jobs
+
+Working through this made the split clearer than any blog post had.
+
+**Facts that change per farm belong in RAG.** A farmer's current crop stage, last operations and headcount change daily, and they're different for every tenant. No adapter can learn them, and an adapter trained on one month's data is wrong the next. The training set itself shows the problem: its greeting calls Sora "your digital livestock assistant", written before crop cycles existed in the app. A fact baked into weights goes stale silently. A fact in an index gets fixed on the next rebuild.
+
+**Behavior is where fine-tuning helps.** Tone, persona, answer format (short bullets, naming missing sections), refusing to invent numbers, and handling French farm vocabulary are stable across tenants. Those are good adapter targets, especially for a small local model that follows long system prompts less reliably than Gemini. Even here the dataset needs care: it calls the assistant one persona name while the RAG prompt uses another. Decide the persona once.
+
+The best version is the combination: a small fine-tuned model that's good at *using* retrieved context, with RAG supplying the facts.
+
+## What I'd tell you before you try it
+
+- **Write the validator before the dataset.** One object per line, fixed keys, allowed roles, alternating turns, no empty answers. Fail the run on the first bad line.
+- **133 samples is a style nudge, not knowledge.** That's enough to shift tone and format. It's not enough to teach domain facts reliably, and it's easy to overfit in three epochs. Hold out an evaluation set from day one.
+- **Keep dtypes consistent.** Model load dtype, 4-bit compute dtype and the trainer's mixed-precision flag should all agree.
+- **Check what LoRA actually wrapped.** Target module names differ between architectures, and a partial match fails silently. Print the trainable parameter count every time.
+- **Expect library churn.** Pin versions, and when you upgrade TRL, rewrite the trainer setup against its current docs instead of patching arguments one error at a time.
+- **Plan the path to production up front.** What's missing here is concrete: merge the adapter into the base weights (PEFT's `merge_and_unload`), convert the merged model to GGUF with llama.cpp and quantize it, register it with Ollama, then point the AI service at it. That last step is only a config change, because the Ollama client already reads its model name from the environment. Before any of that, build an evaluation set of real farmer questions with expected answers, and compare the fine-tuned model plus RAG against the current Gemini setup. If it doesn't win on that set, it doesn't ship.

@@ -1,0 +1,190 @@
+---
+title: "From relational tables to a RAG knowledge base: render markdown, chunk by shape, rebuild on a schedule"
+summary: "Vector stores don't understand foreign keys, so an assistant over farm data needs its records turned into text first. Here's the pipeline in Pro E-Farmer: a NestJS cron renders one markdown document per animal and crop cycle, and a disposable Django/Chroma index chunks them by document shape."
+date: "2026-08-30"
+project: "pro-e-farmer"
+tags: ["RAG", "NestJS", "ChromaDB", "Data pipelines", "Chunking"]
+---
+
+The data behind Pro E-Farmer is relational and spread wide. One crop cycle touches plots, phases, operations, inputs, treatments, harvest stock, harvest movements, pest decisions, expenses, equipment and wallets. One animal production touches reproduction cycles, daily health records, eggs, feed and medications. All of that sits across more than a dozen services in the NestJS API.
+
+The assistant, Sora, needs to answer "what stage is my plantain at?" from that data. A vector store can't join tables, and an embedding of a raw JSON row is close to meaningless. So before any retrieval happens, something has to turn rows into **documents a model can read**.
+
+This post is about that something: a scheduled job in Nest that renders per-business markdown, a sync into a separate AI service, and a chunker that splits each document according to its shape.
+
+## The flow end to end
+
+<Flow steps={[
+  ["Nest cron", "Every 12 hours (or on demand), wipe the generated AI records and walk every business."],
+  ["Nest cron", "Load ~16 datasets per business in parallel with Promise.allSettled, so one failing service leaves an empty section instead of killing the run."],
+  ["Nest cron", "Render markdown: an overview, one ### Animal: section per production, one ### Crop Cycle: section per cycle, with capped lists."],
+  ["Postgres (API)", "Store one business_records row per section, plus one global app description."],
+  ["Django AI service", "POST /knowledge/sync replaces its local copy of the rows in one transaction."],
+  ["Django AI service", "POST /re-index with full_rebuild: reset the Chroma collection and chunk each row by its shape."],
+  ["Chroma", "Upsert chunks with all-MiniLM-L6-v2 embeddings and flat, scalar metadata such as businessId and recordKind."],
+]} />
+
+## 1. Nest owns knowledge generation
+
+The first decision was where the "rows to text" logic lives. It sits in Nest, in `AiRecordsJobScheduler`, because that's where the services, the entities and the business rules already live. The Python service never touches the main database. It receives finished documents.
+
+```ts title="ai-records.schedulers.ts (trimmed)"
+@Cron(CronExpression.EVERY_12_HOURS)
+async processBusinessData() {
+  if (this.running) return;          // a slow run never overlaps the next
+  this.running = true;
+  try {
+    await this.businessRecordService.deleteAllBusinessRecordsAsync();
+    await this.appDescriptionService.deleteAllAppDescriptionsAsync();
+    const businesses = await this.businessService.getBusinessesAsync({
+      paginate: { page: 1, limit: 5000 },
+    });
+    for (const business of businesses.data?.data ?? []) {
+      // load, render, store (below)
+    }
+    await this.appDescriptionService.createAppDescriptionAsync({ description: globalDescription });
+    await this.triggerAiReindex();   // sync + re-index on the AI service
+  } finally {
+    this.running = false;
+  }
+}
+```
+
+The same method backs an on-demand regenerate action, which made debugging much faster than waiting for the next cron tick.
+
+## 2. Load wide, tolerate partial failure
+
+For each business, the job fans out to every service it needs at once:
+
+```ts title="ai-records.schedulers.ts (trimmed)"
+const [animalsResult, expensesResult, /* ...14 more */, harvestTransactionsResult] =
+  await Promise.allSettled([
+    this.animalService.getDeliveredAnimalsAsync(business.id),
+    this.expenseTypesService.getExpenseTypesAsync({ businessId: business.id, paginate: { page: 1, limit: 500 } }),
+    this.cropCyclesService.getCropCyclesAsync({ businessId: business.id }),
+    this.cropCycleOperationsService.listOperationsForBusinessAsync(business.id),
+    // eggs, foods, medications, vets, wallets, products, inputs,
+    // treatments, crop events, harvests, harvest transactions...
+  ]);
+
+const animals =
+  animalsResult.status === 'fulfilled' && animalsResult.value.status
+    ? animalsResult.value.data
+    : [];
+```
+
+`Promise.allSettled` instead of `Promise.all` is the important bit. If the medications query fails for one farm, that farm's document simply has no medications section. The other fifteen datasets, and every other business, still get indexed. In a 12-hour batch job, "mostly complete" is much better than "crashed at business 140".
+
+## 3. Render markdown with stable headings and caps
+
+The renderer writes documents a person could read. Headings are the contract between Nest and the chunker, so they're consistent:
+
+```ts title="ai-records.schedulers.ts (trimmed)"
+lines.push(
+  '',
+  `### Crop Cycle: ${cycle.name} – ${cycle.cropType} (${varietyLabel})`,
+  `Business: ${business.name}`,
+  `Business ID: ${business.id}`,
+  `Status: ${cycle.status}`,
+);
+if (phaseSnapshot?.currentStage) {
+  lines.push(`Current stage: ${labelEnum(phaseSnapshot.currentStage)}`);
+}
+const shownOps = cycleOps.slice(0, CROP_RECORD_OPERATIONS_CAP);   // 30
+const capNote = cycleOps.length > shownOps.length
+  ? ` (latest ${shownOps.length} of ${cycleOps.length})`
+  : ` (${shownOps.length})`;
+lines.push(`- Operations${capNote}`);
+```
+
+A few rules came out of iterating on this:
+
+- **One heading level per entity.** `### Animal:` and `### Crop Cycle:` start an entity. Everything inside a cycle uses `- Plots`, `- Phases`, `- Operations` and so on, so splitting on `### ` still gives exactly one record per cycle.
+- **Repeat the identity.** Each cycle section carries the business name, business ID, crop type and status, so a chunk retrieved on its own still says what it's about.
+- **Cap lists and say so.** Operations and every other list are capped at 30, animal health samples at 5. The "latest 30 of 112" note tells the model, and the farmer, that more exists.
+- **Compute derived facts here.** The current crop stage isn't a column; it comes from the farm-science phase snapshot. The LLM shouldn't be doing date math on planting dates.
+
+Before saving, Nest splits each rendered document on `\n### ` and stores one `business_records` row per animal or cycle, plus a general row for the overview. The global app description gets its own row with platform stats and highlights.
+
+## 4. Sync, then re-index
+
+The Python service is a separate deployment with its own small Postgres. Nest pushes everything in two calls:
+
+```ts title="sync-ai-knowledge.usecase.ts (trimmed)"
+const syncResponse = await this.eFarmerAiAdapter.syncKnowledge({
+  app_descriptions: appDescriptions.data ?? [],
+  business_records: businessRecords.data ?? [],
+});                                           // POST /knowledge/sync, 2 min timeout
+if (!syncResponse.status) return this.serviceResponse.Error(/* ... */);
+
+const reindexResponse = await this.eFarmerAiAdapter.triggerReIndex(true);
+                                              // POST /re-index, 5 min timeout
+```
+
+On the Django side, the sync replaces its tables inside `transaction.atomic()`: delete all, then `bulk_create` in batches of 500. A failed sync leaves the previous copy intact.
+
+## 5. Chunk by document shape
+
+This is where the markdown pays off. `ReindexUseCase.semantic_chunk` looks at what kind of document it has and picks a strategy:
+
+```python title="reindex_usecase.py (trimmed)"
+def semantic_chunk(self, text: str):
+    if re.search(r'^\s*# Pro E-Farmer Global Knowledge Base', text, re.MULTILINE):
+        return self._split_by_markdown_subsections(text)   # keep the ## parent
+    if text.startswith('# Business Knowledge') and '### Animal:' in text:
+        return [f"### {c}" for c in text.split('\n### ')[1:] if c.strip()]
+    if text.startswith('### Crop Cycle:') or '\n### Crop Cycle:' in text:
+        return chunk_crop_cycle_for_index(text)              # section chunks
+    if text.startswith('### Animal:'):
+        return [text.strip()]                                # one chunk per animal
+    if '## Veterinary Services Overview' in text:
+        return [f"- {c}" for c in text.split('\n- ')[1:] if c.strip()]
+    if '## Marketplace Catalogue Overview' in text:
+        return [f"- {c}" for c in text.split('\n- ')[1:] if c.strip()]
+    return self.simple_chunk(text)                           # 500-word windows
+```
+
+Each branch fits a shape:
+
+- **Global knowledge base:** split on `##`, then on `###`, and prefix every subsection with its `##` parent. A chunk about one farm's highlights still says it's under "Crop Production Highlights".
+- **Animals:** one chunk per production. An animal section is short enough to embed whole, and splitting it would separate the headcount from the health records.
+- **Crop cycles:** split into sections (identity, plots, phases, operations, inputs, treatments, harvest, observations, decisions), each prefixed with a banner of the cycle name, status and current stage. Long sections become at most two 1,400-character slices, and one cycle yields at most 10 chunks, so a busy cycle can't flood the collection.
+- **Directories:** vet services and marketplace products split per bullet, one item per chunk.
+- **Anything else:** 500-word windows with a 5-word overlap.
+
+<Callout tone="tip">
+If you control the document generator, design the documents for the chunker. Stable headings turned chunking from a guessing game about token windows into a switch statement on known shapes.
+</Callout>
+
+## 6. Flatten metadata for Chroma
+
+Chroma metadata values must be scalars, and the Nest rows carry a `meta` JSON object that can be nested. The indexer keeps only what Chroma accepts and adds a record kind:
+
+```python title="reindex_usecase.py (trimmed)"
+for chunk in chunks:
+    extra = crop_chunk_metadata(chunk)   # recordKind, cropType for cycle chunks
+    flat = {k: v for k, v in metadata_common.items()
+            if isinstance(v, (str, int, float, bool))}
+    flat.update(extra)
+    chunk_metas.append(flat)
+```
+
+`businessId` always survives that filter, which matters: it's what the retrieval side uses for tenant isolation (`businessId $in` the farmer's businesses). `recordKind: "crop_cycle"` lets retrieval ask for crop sections directly instead of hoping they rank.
+
+<Callout tone="warn">
+A single nested value in one chunk's metadata can fail the whole upsert batch. Flatten at the boundary, in one function, and drop what you can't represent rather than stringifying JSON you'll never filter on.
+</Callout>
+
+## Why the AI service is disposable
+
+Nest is the source of truth for both the data *and* the knowledge documents. The Django service holds a copy of the rows and a Chroma index derived from them, and nothing else. If the index is corrupted, or I change the chunker or the embedding model, the fix is the same: sync and rebuild. No migration, no backfill script, no fear.
+
+That also kept the Python side small. It doesn't know what a crop cycle is in database terms. It knows `### Crop Cycle:` headings.
+
+## What I'd tell you before you build one
+
+- **Full rebuilds are simple, and they have a cost.** Every run deletes and regenerates all records in Nest, replaces all rows in the AI service, resets the collection and re-embeds everything. That's easy to reason about at this size. It also means the index is empty while re-embedding runs, and answers are up to 12 hours stale. The next step is incremental: hash each rendered section, re-embed only changed ones, and upsert by a stable ID such as the cycle ID instead of a row ID. Building into a fresh collection and swapping it in would remove the empty window, too.
+- **Filter by business type at generation time.** The job currently writes both an animal record and a crop record for every business, including a "no animal data" note for crop farms, and the global description always includes livestock totals. That's how crop answers ended up sounding like livestock. Skip sections the business type doesn't support, and put the type in metadata so retrieval can filter on it.
+- **Keep the boilerplate out, or label it.** Lines like "Monitoring covers growth stages, plots…" describe the product, not the farm. The model treated them as facts until the prompt explicitly said otherwise. Cheaper to never render them.
+- **Render, then read.** The best debugging tool was opening a generated document and reading it as a farmer would. If a person can't answer the question from the document, the model won't either.
+- **Live reads for live questions.** A 12-hour index is fine for "how many cycles do I have?" and wrong for "did my last spraying get recorded?". The planned agent version fetches the one cycle a question names straight from the live services, using the same section builder, and keeps the index for search.

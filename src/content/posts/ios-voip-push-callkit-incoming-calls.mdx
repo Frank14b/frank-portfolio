@@ -1,0 +1,216 @@
+---
+title: "Incoming calls that ring when the app is dead: VoIP push, CallKit and data-only FCM in React Native"
+summary: "A calling app is only as good as its ring, and a ring that needs a live WebSocket fails the moment iOS or Android kills your process. Here's the push-only pipeline I built for MboaMeet: PushKit reported to CallKit in native Swift before JavaScript boots, data-only FCM on Android, and a server that routes each token to the right transport."
+date: "2026-07-08"
+project: "mboameet"
+tags: ["React Native", "iOS", "CallKit", "PushKit", "ASP.NET Core", "Push notifications"]
+---
+
+MboaMeet has 1:1 audio and video calls. The first version rang the callee over SignalR: if the callee had a live hub connection, the server sent a ping, waited for an ack, then sent `CallIncoming`, and fell back to a push only when the ping timed out.
+
+That works for a demo, but a phone in a pocket doesn't have a live WebSocket. iOS suspends the app within seconds of backgrounding and kills it under memory pressure, and Android's battery optimizations do the same. A call that only rings while the app is open isn't much of a phone call.
+
+So I rebuilt the ring path around the OS: a **VoIP push on iOS that reports to CallKit before any JavaScript runs**, a **data-only high-priority FCM message on Android** that wakes a headless JS task, and a server that knows which transport each device token needs.
+
+## The flow end to end
+
+<Flow steps={[
+  ["Caller app", "Invokes StartCall on the SignalR hub. The server validates the call, records it and returns a callId right away."],
+  ["API", "Fire-and-forget: loads the callee's incoming-call tokens and builds one payload contract (callId, uuid, callerName, mode, mediaTransport)."],
+  ["Push adapter", "Routes each token by shape: Expo token to Expo, FCM token to data-only FCM, hex PushKit token to APNs VoIP (priority 10, 5 s expiry)."],
+  ["iOS AppDelegate", "PushKit wakes the process. Injected Swift calls RNCallKeep.reportNewIncomingCall before React exists, then hands the payload to JS."],
+  ["Android", "The FCM background handler awaits initCallKeep and displayIncomingCall so the headless runtime stays alive until the system call screen is up."],
+  ["JS callkeep service", "Caches callId ↔ CallKit UUID, dedupes repeat pushes, and on Answer navigates to the call screen."],
+  ["Callee app", "Answers over SignalR (AcceptCall) and WebRTC takes over. Hang-ups end the native call by the same UUID."],
+]} />
+
+## 1. Register for VoIP pushes before React mounts
+
+PushKit has one hard rule: if a VoIP push arrives and the app doesn't report a call to CallKit, iOS 13+ terminates the app, and after repeated failures stops delivering VoIP pushes to it altogether. On a cold start, the push can arrive before the React tree (or even the JS bundle) is ready.
+
+So the registration happens at module load. `index.js` imports the VoIP module before `expo-router/entry`:
+
+```js title="index.js (trimmed)"
+import './voipPushRegistration';
+if (Platform.OS === 'android') {
+  require('./fcmPushRegistration');
+}
+import { registerGlobals } from '@livekit/react-native';
+registerGlobals();
+import 'expo-router/entry';
+```
+
+Inside, the module waits for CallKeep's setup and then attaches the PushKit listeners, including `didLoadWithEvents`, which replays pushes that arrived before JS was listening:
+
+```ts title="voipPushRegistration.ts (trimmed)"
+VoipPushNotification.addEventListener('notification', (n) =>
+  handleIncomingCallPushData(voipNotificationToRecord(n), { nativeCallKitReported: true }));
+
+VoipPushNotification.addEventListener('didLoadWithEvents', (events) => {
+  for (const ev of events ?? []) {
+    if (ev.name === VoipPushNotification.RNVoipPushRemoteNotificationReceivedEvent) dispatch(ev.data);
+  }
+});
+
+VoipPushNotification.addEventListener('register', (token: string) => {
+  voipToken = token.trim();
+  voipTokenListeners.forEach((l) => l(voipToken!));
+});
+VoipPushNotification.registerVoipToken();
+```
+
+The PushKit token travels to the API next to the regular Expo token. The server keeps two token lists per user, and for incoming calls it prefers the VoIP token when a device has one.
+
+## 2. Report the call in native code, not JavaScript
+
+Even with early registration, reporting from JS is a race against the bundle loading. The reliable answer is to report to CallKit inside the PushKit delegate itself. This is an Expo app with prebuild, so I don't hand-edit `AppDelegate.swift`; an Expo config plugin (`plugins/withVoipPushNotification.js`) injects the code on every prebuild:
+
+- It adds a bridging header, because `react-native-voip-push-notification` and `react-native-callkeep` are Objective-C pods with no Swift module.
+- It links `PushKit.framework` and calls `voipRegistration()` at the top of `didFinishLaunchingWithOptions`.
+- It appends a `PKPushRegistryDelegate` extension to `AppDelegate`, guarded by a marker string so repeated prebuilds stay idempotent.
+
+The delegate is the heart of it:
+
+```swift title="AppDelegate.swift (injected by the plugin, trimmed)"
+let data = payload.dictionaryPayload
+guard let uuidRaw = data["uuid"] as? String, let callUuid = UUID(uuidString: uuidRaw) else {
+  RNVoipPushNotificationManager.didReceiveIncomingPush(with: payload, forType: type.rawValue)
+  completion(); return
+}
+let typeRaw = (data["type"] as? String)?.lowercased() ?? ""
+if typeRaw == "call_ended" || typeRaw == "call_rejected" {
+  RNCallKeep.endCall(withUUID: callUuid.uuidString.lowercased(), reason: 2)
+  RNVoipPushNotificationManager.didReceiveIncomingPush(with: payload, forType: type.rawValue)
+  completion(); return
+}
+RNCallKeep.reportNewIncomingCall(
+  callUuid.uuidString.lowercased(),
+  handle: handle, handleType: "number", hasVideo: mode == "video",
+  localizedCallerName: callerName,
+  supportsHolding: false, supportsDTMF: false, supportsGrouping: false, supportsUngrouping: false,
+  fromPushKit: true, payload: data,
+  withCompletionHandler: completion)
+RNVoipPushNotificationManager.didReceiveIncomingPush(with: payload, forType: type.rawValue)
+```
+
+Two details are easy to get wrong. First, every branch calls PushKit's `completion`, including the early returns; the incoming-call branch passes it to `reportNewIncomingCall` so it fires only after CallKit accepted the call. Second, lifecycle pushes (`call_ended`, `call_rejected`) reuse the same `uuid` key, so the native side can tear down the exact CallKit call that's ringing without any lookup table.
+
+<Callout tone="warn">
+Use the PushKit delegate overload *with* a `completion` parameter. The older overload without it is deprecated, and if you report the call from JavaScript instead, `completion` tends to fire before CallKit has the call, which is exactly the case iOS punishes by terminating the app.
+</Callout>
+
+## 3. Make JavaScript idempotent, because pushes arrive more than once
+
+Once native code owns the ring, the JS side has a narrower job: remember which server `callId` belongs to which CallKit UUID so that Answer and End can be routed. With `nativeCallKitReported: true` it never calls `displayIncomingCall` on iOS; it only caches metadata.
+
+The same call can reach the JS service several ways: PushKit, an Expo notification listener, the Expo background task, a retry. `services/callkeep.service.ts` keeps three small sets to absorb that:
+
+```ts title="callkeep.service.ts (trimmed)"
+const displayedCallIds = new Set<string>();     // expires after 120 s
+const nativeRingInFlight = new Set<string>();   // a displayIncomingCall is still running
+const recentlyEndedCallIds = new Set<string>(); // ignore late pushes for 90 s
+
+if (isRecentlyEndedCall(fields.callId)) { /* end any native UI, complete, return */ }
+if (displayedCallIds.has(fields.callId) || nativeRingInFlight.has(fields.callId)) {
+  ensureIncomingCallInApp(fields);
+  return;
+}
+if (Platform.OS === 'ios' && options?.nativeCallKitReported) {
+  rememberNativeReportedCall(raw, fields); // uuidToMeta.set(uuid, { callId, callerId, mode, ... })
+  ensureIncomingCallInApp(fields);
+  return;
+}
+void routeIncomingCallPush(raw, fields, options);
+```
+
+Cold starts brought two more fixes:
+
+- **Answer before metadata.** The user can tap Accept on CallKit before the JS push handler has filled `uuidToMeta`. The answer handler polls up to 10 times at 150 ms instead of silently dropping the tap.
+- **Events fired before listeners exist.** When CallKit launches the app from an Answer, `react-native-callkeep` buffers the event natively. I call `getInitialEvents()` after setup and replay them; without this, the audio session connects but the app never navigates to the call screen.
+
+For non-VoIP paths, `routeIncomingCallPush` checks `AppState`. On iOS, a call that arrives while the app is in the foreground shows the in-app overlay instead of CallKit. On Android the app is a self-managed ConnectionService, which must supply its own telecom session, so it registers the native call in both states. Before displaying a new call, it also clears stale sessions with `endAllCalls()`, because both CallKit and ConnectionService can hold on to a half-torn-down call and refuse the next one. The UUID passed to them is always an RFC 4122 UUID, never the raw server id.
+
+## 4. Android: data-only, high priority, and await everything
+
+On Android there's no PushKit. The equivalent is a **data-only** FCM message with high priority. If the message carries a `notification` block, Android shows a tray notification and your background handler may never run. The server builds the incoming-call message with no notification at all:
+
+```csharp title="PushNotificationAdapter.cs (trimmed)"
+// Android: must not set Notification; priority high.
+var message = new Message
+{
+    Token = registrationToken,
+    Data = dataDict,
+    Android = new AndroidConfig { Priority = Priority.High },
+};
+await FirebaseMessaging.DefaultInstance.SendAsync(message, cancellationToken);
+```
+
+On the device, `@react-native-firebase/messaging`'s background handler keeps the headless JS runtime alive for as long as its promise is pending. So it awaits the full chain, `initCallKeep()` then the async push handler that ends in `RNCallKeep.displayIncomingCall`. A fire-and-forget call here is how you get a ring that works on your phone and not on a mid-range device with aggressive OEM battery rules.
+
+## 5. The server routes by token shape
+
+Every user can have a mix of tokens: an Expo token from an older build, an FCM registration token, a PushKit token. `SendIncomingCallAsync` picks the transport from the token itself:
+
+```csharp title="PushNotificationAdapter.cs (trimmed)"
+if (IsExpoPushToken(pushToken))                       // "ExponentPushToken[…]"
+    await SendExpoPushAsync(pushToken, title, body, data, delivery, ct);
+else if (pushToken.Contains(':'))                     // FCM registration token
+    await SendFcmIncomingDataOnlyAsync(pushToken, data, delivery, ct);
+else if (IsLikelyNativeIosApnsDeviceToken(pushToken)) // 32–128 hex chars
+{
+    // PushKit token: topic must be {bundleId}.voip. Never fall back to an alert push.
+    await TrySendVoipIncomingCallAsync(pushToken, data, ct);
+}
+else
+    await SendApnsAsync(pushToken, title, body, data, ct);
+```
+
+The VoIP send uses dotAPNS with the settings Apple expects for a ring:
+
+```csharp title="PushNotificationAdapter.cs (trimmed)"
+var push = new ApplePush(ApplePushType.Voip)
+    .AddVoipToken(deviceToken)
+    .AddContentAvailable()
+    .AddExpiration(DateTimeOffset.UtcNow.AddSeconds(5))
+    .SetPriority(10);
+if (!voipOpts.UseProduction) push.SendToDevelopmentServer();
+foreach (var kv in data) push.AddCustomProperty(kv.Key, kv.Value);
+```
+
+The 5-second expiration matters more than it looks. If the phone is offline, APNs would otherwise store the push and deliver it when the device reconnects, and a call that rings a minute after the caller gave up is worse than a missed call.
+
+Most of my debugging time went to certificates, so the adapter now validates the VoIP certificate when it loads it. PushKit needs a **VoIP Services** certificate whose topic ends in `.voip` and matches the configured bundle id plus `.voip`. Export the wrong push type and APNs answers with `DeviceTokenNotForTopic` on every send. The adapter refuses to build a client from a certificate whose topic doesn't end in `.voip` and logs exactly which certificate type to re-export. Sandbox versus production is the other trap: development builds get sandbox tokens, so the environment flag has to match the build that registered the token. Tokens that come back `BadDeviceToken`, `Unregistered` or `DeviceTokenNotForTopic` are recorded as invalid.
+
+## 6. One payload contract, mirrored on both sides
+
+All of this only works if the native Swift, the JS service and the C# server agree on key names. The contract lives in two files that reference each other, `constants/incomingCallPush.ts` in the app and `IncomingCallPushConstants.cs` on the server:
+
+- `mboameet_incoming_call: "1"` and `type: "incoming_call"` mark a ring; `call_ended` and `call_rejected` are the lifecycle types.
+- `callId`, `callerId`, `callerName`, `mode` and `mediaTransport` describe the call.
+- `uuid` carries the same value as `callId` (a GUID string) so CallKit and the server share one identifier, and `handle` is the caller id.
+
+All values are strings, because FCM data maps only accept strings. For ids that aren't already UUIDs, the server has a line-for-line C# port of the app's id-to-UUID function, so both sides always derive the same CallKit UUID.
+
+## Why I turned off the SignalR ring
+
+With push in place, I deleted the ping/ack dance from `StartCall`. It now validates, creates the session, returns the `callId`, and fires the push without awaiting it:
+
+```csharp title="AppHub.cs (trimmed)"
+Guid callId = _callSignaling.CreateCall(callerId, calleeUserId, mode, clientMediaTransport);
+await _chatMediator.RecordCallStartedAsync(callId, callerId, calleeUserId, mode, mediaTransport);
+
+// Incoming call UX: VoIP / data-only push only. SignalR CallPing + CallIncoming are disabled.
+_ = SendIncomingCallPushAsync(calleeUserId, callerId, callId, mode, mediaTransport, ct);
+return callId;
+```
+
+With two ring paths, the client had to reconcile a SignalR ring and a push ring for the same call, and the push only went out after the ping timed out, which added delay in exactly the case that matters: a backgrounded app with a stale socket. One path, owned by the OS and sent immediately, is easier to reason about. For the "app was killed while ringing" case, the app calls a `pending-incoming` endpoint once after its hub connects; if the user's latest call is still ringing and less than a minute old, the server restores the session and re-sends the push.
+
+## What I'd tell you before you build one
+
+- **Report to CallKit in native code.** Treat JS as a metadata cache for the call, not the thing that makes it ring. It removes a whole class of cold-start races.
+- **Call `completion` on every path.** Dedupe hits, parse failures, lifecycle pushes: each one still has to complete, or iOS will eventually stop delivering VoIP pushes to you.
+- **Use one identifier everywhere.** Sending the call id as the CallKit `uuid` let native code end a ringing call from a push with no lookup.
+- **Set a short expiration on ring pushes.** A late ring is a bug.
+- **Validate certificates at startup and log loudly.** Most of my debugging was a mismatched topic or environment, not code.
+- **Next on my list:** the native side and the contract already handle `call_ended`, but today the server only pushes `call_rejected` (to the caller). A callee whose app was killed learns about a caller hang-up over SignalR once the woken app connects. Sending `call_ended` as a VoIP push to the callee's devices would dismiss CallKit immediately, and it's a small change because every other layer is ready for it.

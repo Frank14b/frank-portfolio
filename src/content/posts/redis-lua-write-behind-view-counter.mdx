@@ -1,0 +1,105 @@
+---
+title: "A write-behind view counter with two Lua scripts and one Postgres UPDATE"
+summary: "Counting video views with one UPDATE per view turns your hottest table into a lock queue. Here's how MboaMeet dedupes views in Redis with a single Lua round trip, buffers them in a hash, and flushes them to Postgres every five minutes in one statement, plus the failure mode I accepted and how I'd remove it."
+date: "2026-10-04"
+project: "mboameet"
+tags: ["Redis", "Lua", "PostgreSQL", "ASP.NET Core", "Performance"]
+---
+
+MboaMeet's feed shows a view count on every video. The obvious implementation is `UPDATE feeds SET "Views" = "Views" + 1 WHERE "Id" = @id` on every view. On a vertical feed, where people swipe through dozens of clips a minute and a popular post gets most of the traffic, that means many concurrent writers updating the same row, each waiting for the previous one's row lock. The counter becomes the bottleneck of the feed table.
+
+Views also need some dedupe. Scrolling back and forth over the same clip shouldn't count ten times.
+
+The fix is a **write-behind** counter: accept views in Redis, which is built for this, and write them to Postgres in bulk on a timer.
+
+## The flow end to end
+
+<Flow steps={[
+  ["Mobile app", "Fires POST /feeds/{id}/views without waiting for the response when a post becomes the active item in the feed."],
+  ["API", "Runs one Lua script in Redis: SET NX EX on a per-user, per-feed gate key, and HINCRBY on the buffer hash only if the gate was new."],
+  ["Redis", "Holds pending increments in one hash: field = feed id, value = views since the last flush."],
+  ["Background service", "Every 5 minutes, runs a second Lua script that reads the whole hash and deletes the fields it read, atomically."],
+  ["Postgres", "One UPDATE … FROM unnest(@ids, @cnts) applies every increment in a single statement."],
+]} />
+
+## 1. Dedupe and count in one round trip
+
+The rule is one counted view per user per feed per hour. Doing that with two commands from C# (check the gate, then increment) leaves a gap where two requests from the same user both pass the check. A Lua script runs atomically inside Redis, so the check and the increment can't interleave:
+
+```csharp title="ReelViewTrackingService.cs (trimmed)"
+/// KEYS[1] gate, KEYS[2] buffer hash; ARGV[1] TTL seconds, ARGV[2] hash field (feed id).
+private const string RecordViewLua = """
+    if redis.call('SET', KEYS[1], '1', 'EX', ARGV[1], 'NX') then
+      return redis.call('HINCRBY', KEYS[2], ARGV[2], 1)
+    end
+    return 0
+    """;
+
+var result = await _db.ScriptEvaluateAsync(
+    RecordViewLua,
+    keys: [ReelViewRedisKeys.GateKey(userId, feedId), ReelViewRedisKeys.ViewBufferHash],
+    values: [ReelViewRedisKeys.ViewGateTtlSeconds, feedId.ToString()]);   // 3600 s
+return (long)result > 0;
+```
+
+`SET key 1 EX 3600 NX` only succeeds if the key doesn't exist, and it sets the one-hour expiry in the same command, so there's no separate `EXPIRE` that could be lost. If it succeeds, the script increments that feed's field in the buffer hash. The expiring gate keys do the cleanup themselves: nothing has to sweep them.
+
+The endpoint returns `{ recorded: true/false }`, and any Redis failure is logged and reported as "not recorded" instead of failing the request. A view counter isn't worth a 500 on the feed.
+
+## 2. Drain the buffer atomically
+
+Every five minutes, `ReelViewBufferFlushBackgroundService` runs the flush. The first step is to take everything that's in the hash *and* remove it, without losing increments that arrive in between. `HGETALL` followed by a separate `DEL` from C# would drop every view recorded between the two calls. In Lua, it's one atomic operation:
+
+```csharp title="ReelViewBufferFlushProcessor.cs (trimmed)"
+private const string PopBufferLua = """
+    local hkey = KEYS[1]
+    local flat = redis.call('HGETALL', hkey)
+    if #flat == 0 then return flat end
+    for i=1,#flat,2 do
+      redis.call('HDEL', hkey, flat[i])
+    end
+    return flat
+    """;
+```
+
+A view recorded after the script runs simply starts a new count in the now-empty hash and waits for the next flush. The C# side then parses the flat `[id, count, id, count, …]` reply into two arrays, skipping anything that isn't a positive integer.
+
+## 3. One UPDATE for every feed
+
+Instead of one statement per feed, the whole batch goes to Postgres as two arrays, and `unnest` turns them back into rows to join against:
+
+```csharp title="ReelViewBufferFlushProcessor.cs (trimmed)"
+await using var cmd = new NpgsqlCommand(
+    """
+    UPDATE feeds AS f
+    SET "Views" = f."Views" + d.cnt
+    FROM (SELECT * FROM unnest(@ids::integer[], @cnts::integer[]) AS x(id, cnt)) AS d
+    WHERE f."Id" = d.id
+    """, conn);
+cmd.Parameters.Add(new NpgsqlParameter("ids", NpgsqlDbType.Integer | NpgsqlDbType.Array) { Value = idArray });
+cmd.Parameters.Add(new NpgsqlParameter("cnts", NpgsqlDbType.Integer | NpgsqlDbType.Array) { Value = incArray });
+await cmd.ExecuteNonQueryAsync(cancellationToken);
+```
+
+It's fully parameterized, it's one round trip regardless of how many feeds changed, and each feed row is touched once per flush instead of once per view. A post that got 4,000 views in five minutes costs one row update, not 4,000. The trade is freshness: the count in Postgres can be up to five minutes behind, which is fine for a number on a video card.
+
+<Callout tone="warn">
+Notice the order: the buffer is drained from Redis *before* the Postgres write. If the UPDATE fails (database restart, network blip, deploy at the wrong moment), the error is logged, but those counts are already gone from Redis. They're lost, not retried.
+</Callout>
+
+## The failure mode I accepted, and how I'd remove it
+
+For view counts, I accepted that trade. Losing a few minutes of views during a rare database outage is invisible to users, and the code stays very small. I wouldn't ship the same shape for anything that touches money or that users would notice going missing. There are two standard ways to close the gap:
+
+**Rename to a processing key.** Instead of reading and deleting fields, atomically `RENAME reels:view_buffer` to a processing key (only if the processing key doesn't already exist), then read it, write to Postgres, and `DEL` the processing key only after the UPDATE commits. New views go into a fresh buffer hash in the meantime. If the write fails, the processing key is still there and the next run retries it first. Since `RENAME` is a single atomic command, nothing recorded during the flush is lost either.
+
+**Add the counts back on failure.** Keep the current drain, and in the catch block run `HINCRBY` for each drained `(id, count)` pair back into the buffer. Increments are commutative, so merging them back with views that arrived in the meantime gives the right total. It's the smaller change, but it doesn't help if the process itself dies between the drain and the write.
+
+Both approaches move the counter to at-least-once delivery, so there's still a narrow case to think about: the UPDATE commits, then the process dies before it deletes the processing key, and the next run applies the same counts again. For views, a rare double count is an acceptable error. For anything stricter, you'd record a flush id in the same Postgres transaction and skip batches you've already applied.
+
+## What I'd tell you before you build one
+
+- **Put the check and the write in one Lua script.** Any check-then-act across two Redis commands is a race.
+- **Let TTLs do the cleanup.** `SET NX EX` gives you a rate-limit window and garbage collection in one command.
+- **Batch writes with arrays and `unnest`.** One parameterized statement scales with the number of rows changed, not the number of events.
+- **Decide your delivery guarantee on purpose.** Draining before writing is at-most-once. That's a fine choice for view counts, as long as it's a choice and not an accident.

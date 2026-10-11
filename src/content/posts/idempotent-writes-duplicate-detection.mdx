@@ -1,0 +1,207 @@
+---
+title: "Saving a transaction exactly once: idempotency keys from the form to the database"
+summary: "A double click, a timeout retry or two racing requests can each record the same expense twice. Here's how an Idempotency-Key that the client derives from the form, a strict server-side replay and a soft lookalike check together make 'Save' safe to press again."
+date: "2026-10-02"
+project: "qashio"
+tags: ["Idempotency", "NestJS", "Next.js", "PostgreSQL", "API design"]
+---
+
+In the Qashio expense tracker, the most important button is "Add expense". It's also the easiest one to press twice. Someone taps it, the network stalls, they tap it again, and now there are two 42.50 charges at Carrefour and a budget alert that shouldn't have fired.
+
+Disabling the button while the request is in flight helps, but it doesn't cover the real failure modes. A request can time out on the client after the server has already committed. A flaky mobile connection can make the browser retry. Two requests can arrive at the API at the same moment. The only fix that survives all of these lives on the server: **the client tells the API which user action a request belongs to, and the API records each action at most once.**
+
+A second, softer problem turned up along the way. Sometimes the user really does type the same expense twice, as two separate actions. That isn't a retry, so idempotency won't catch it, but it's usually a mistake. I handle that with a different mechanism that asks before saving.
+
+## The flow end to end
+
+<Flow steps={[
+  ["Form", "On submit, useIdempotencyKey fingerprints the payload and returns a UUID: the same one if the payload is unchanged, a fresh one if the user edited the form."],
+  ["Browser", "POST /transactions with the Idempotency-Key header."],
+  ["API", "Looks up an existing transaction for (user, key). If found and the payload matches, it returns that row with Idempotent-Replayed: true. If the payload differs, it answers 422."],
+  ["API", "No prior row: validates wallet, category and amount, then looks for a lookalike created in the last 2 minutes. If one exists, it answers 409 POSSIBLE_DUPLICATE."],
+  ["Form", "PossibleDuplicateDialog shows the earlier entry. Save anyway resends the same payload and key with confirmDuplicate: true."],
+  ["Postgres", "INSERT with a partial unique index on (user_id, idempotency_key), plus the outbox event, in one transaction."],
+  ["API", "If a concurrent request with the same key won the insert, the unique violation becomes DuplicateIdempotencyKeyError and the loser replays the winner's row."],
+]} />
+
+## 1. One key per user action, derived from the payload
+
+The interesting decision is *when* the client mints a new key. A key per click is wrong, because a double click becomes two actions. A key per page mount is also wrong: if the user saves, gets a 409, fixes the amount and saves again, that's a new action, and reusing the key would correctly get a 422 from the server.
+
+So the key follows the payload. Same payload, same key. Edited payload, new key:
+
+```ts title="useIdempotencyKey.ts"
+export function useIdempotencyKey<T>(): (payload: T) => string {
+  const last = useRef<{ fingerprint: string; key: string } | null>(null);
+
+  return (payload) => {
+    const fingerprint = JSON.stringify(payload);
+    if (last.current?.fingerprint !== fingerprint) {
+      last.current = { fingerprint, key: crypto.randomUUID() };
+    }
+    return last.current.key;
+  };
+}
+```
+
+It's deliberately tiny. A `useRef` keeps the last fingerprint and key across renders without triggering any, and `JSON.stringify` works as a fingerprint because the payload comes from `toTransactionPayload`, which builds it in a stable shape every time.
+
+The page asks for the key at the moment it saves, so every path through `save` (first submit, retry, "Save anyway") goes through the same function:
+
+```tsx title="new/page.tsx (trimmed)"
+const save = async (payload: CreateTransactionPayload, confirmDuplicate = false) => {
+  try {
+    await createTransaction.mutateAsync({
+      payload,
+      idempotencyKey: idempotencyKeyFor(payload),
+      confirmDuplicate,
+    });
+    router.push('/transactions');
+  } catch (error) {
+    const duplicateOf = getPossibleDuplicate(error);
+    setPendingDuplicate(duplicateOf ? { payload, duplicateOf } : null);
+  }
+};
+```
+
+The service puts the key in a header, not the body. It's request metadata rather than transaction data, and the header name matches the common convention (Stripe and the IETF draft both use `Idempotency-Key`):
+
+```ts title="transactions.service.ts"
+create: (payload, { idempotencyKey, confirmDuplicate }, config) =>
+  api.post<Transaction>(
+    '/transactions',
+    confirmDuplicate ? { ...payload, confirmDuplicate } : payload,
+    { ...config, headers: { ...config?.headers, 'Idempotency-Key': idempotencyKey } },
+  ),
+```
+
+`confirmDuplicate` is the one field that isn't part of the fingerprint, since it's passed separately from `payload`. That matters: "Save anyway" reuses the original key.
+
+## 2. Replay, but only for the same request
+
+On the API, the controller reads the header through a small param decorator and runs it through `ParseUUIDPipe`, so a missing or malformed key is a 400 before any business logic runs. The use case then checks for a prior result first:
+
+```ts title="create-transaction.use-case.ts (trimmed)"
+async execute(command: CreateTransactionCommand): Promise<CreateTransactionResult> {
+  const previous = await this.transactions.findByIdempotencyKey(
+    command.userId,
+    command.idempotencyKey,
+  );
+  if (previous) {
+    return this.replay(previous, command);
+  }
+  // ...validate, lookalike check, insert
+}
+
+private replay(previous: Transaction, command: CreateTransactionCommand) {
+  if (!this.matchesCommand(previous, command)) {
+    throw new UnprocessableEntityException(
+      'Idempotency-Key was already used for a different transaction; send a new key',
+    );
+  }
+  return { transaction: previous, replayed: true };
+}
+```
+
+A replay returns the original transaction with the normal success response. The only difference is an `Idempotent-Replayed: true` header, which is added to CORS `exposedHeaders` so the browser can read it. Nothing is inserted, and no outbox event is emitted, so budgets and notifications don't fire a second time.
+
+The 422 branch is the part most implementations skip. If a key comes back with a different amount, something is wrong on the client, and silently returning the old transaction would hide a real bug. The comparison has a few traps:
+
+```ts title="create-transaction.use-case.ts"
+private matchesCommand(previous: Transaction, command: CreateTransactionCommand): boolean {
+  let sameAmount: boolean;
+  try {
+    sameAmount = new Decimal(command.amount).eq(previous.amount);
+  } catch {
+    sameAmount = false;
+  }
+  return (
+    sameAmount &&
+    previous.type === command.type &&
+    previous.categoryId === command.categoryId &&
+    (command.accountId === undefined || previous.accountId === command.accountId) &&
+    previous.counterparty === (cleanOptionalText(command.counterparty) ?? null) &&
+    previous.narration === (cleanOptionalText(command.narration) ?? null) &&
+    (command.occurredAt === undefined ||
+      previous.occurredAt.getTime() === command.occurredAt.getTime())
+  );
+}
+```
+
+- **Amounts are compared as decimals.** The client may send `"42.50"` or `42.5`, and Postgres stores a normalized numeric. A string comparison would turn a legitimate retry into a 422.
+- **Server-side defaults are skipped.** The web form always sends a wallet and date, but the API accepts requests without them. If a client omitted either, the server filled it in on the first request. Comparing them against `undefined` would always fail.
+- **Text goes through the same cleaning as the insert.** Otherwise a trailing space would count as a different request.
+
+<Callout tone="warn">
+Compare the request against what you *stored*, using the same normalization you applied when storing it. Any mismatch between the two paths turns honest retries into errors, and the user only sees them on a bad network, which is the worst time to debug.
+</Callout>
+
+## 3. The race: two requests, one key
+
+The lookup-then-insert above has an obvious gap. Two requests with the same key can both find nothing and both try to insert. The database closes that gap:
+
+```sql
+CREATE UNIQUE INDEX "UQ_transactions_user_idempotency_key"
+  ON "transactions" ("user_id", "idempotency_key")
+  WHERE "idempotency_key" IS NOT NULL
+```
+
+The index is scoped per user, and it's partial because rows created before keys existed have a null key. The repository maps a unique violation on that specific constraint to a domain error, `DuplicateIdempotencyKeyError`, so the use case never has to know about Postgres error codes. The use case treats the loser of the race exactly like a retry:
+
+```ts title="create-transaction.use-case.ts (trimmed)"
+} catch (error) {
+  // A concurrent request with the same key won the insert: answer like a retry.
+  if (!(error instanceof DuplicateIdempotencyKeyError)) {
+    throw error;
+  }
+  const winner = await this.transactions.findByIdempotencyKey(
+    command.userId,
+    command.idempotencyKey,
+  );
+  if (!winner) {
+    throw error;
+  }
+  return this.replay(winner, command);
+}
+```
+
+Because the insert and its `transaction.created` outbox event share one unit of work, the losing request's event rolls back with its row. Downstream consumers see one event, from the winner. The spec covers this case directly: `create` rejects with `DuplicateIdempotencyKeyError`, the second lookup returns the winner, and the test asserts `replayed: true` with no event emitted.
+
+## 4. Lookalikes: a 409 that asks instead of refusing
+
+Idempotency answers "is this the same request?" It can't answer "did the user mean to enter this twice?" For that, after validation and before the insert, the use case looks for a transaction with the same wallet, category, type and amount (and counterparty, case-insensitive, when one is given) created in the last two minutes:
+
+```ts title="create-transaction.use-case.ts (trimmed)"
+export const POSSIBLE_DUPLICATE_WINDOW_MS = 2 * 60 * 1000;
+
+if (!command.confirmDuplicate) {
+  const lookalike = await this.transactions.findPossibleDuplicate({
+    userId: command.userId, accountId: account.id, categoryId: command.categoryId,
+    type: command.type, amount, counterparty,
+    createdSince: new Date(Date.now() - POSSIBLE_DUPLICATE_WINDOW_MS),
+    excludeIdempotencyKey: command.idempotencyKey,
+  });
+  if (lookalike) throw this.possibleDuplicate(lookalike);
+}
+```
+
+Two details make this cooperate with idempotency instead of fighting it:
+
+- **It runs after the replay check.** A true retry never reaches it.
+- **`excludeIdempotencyKey` uses `IS DISTINCT FROM`**, so a row with the caller's own key never counts as its own duplicate, and legacy rows with a null key still match.
+
+The 409 body carries `code: 'POSSIBLE_DUPLICATE'` and a `details.duplicateOf` object with the earlier entry's reference, formatted amount, currency, counterparty and timestamps. On the client, `getPossibleDuplicate` returns that object only for a 409 with that code, so every other error still shows the normal alert. `PossibleDuplicateDialog` renders something like "A matching expense of $42.50 at Carrefour was recorded 30 seconds ago" using `Intl.RelativeTimeFormat`, with Cancel and "Save anyway" buttons that are disabled while the save is pending.
+
+"Save anyway" calls `save(pendingDuplicate.payload, true)`. Same payload means same fingerprint, which means same key. If the confirmed request itself times out and is retried, it replays instead of creating a third row.
+
+<Callout tone="tip">
+Keep the hard guarantee and the soft heuristic separate. The idempotency key is a contract enforced by a unique index. The lookalike check is a UX judgment call with a tunable window and an explicit override. Mixing them, for example by deduplicating on amount and time alone, either blocks legitimate entries or misses real retries.
+</Callout>
+
+## What I'd tell you before you build one
+
+- **Generate the key from intent, not from clicks or mounts.** Fingerprinting the payload turned out to be the simplest rule that handles double clicks, retries, edits and confirmations correctly.
+- **Reject key reuse with different data.** A silent replay would hide exactly the client bugs a 422 surfaces. Compare amounts as decimals and skip fields the server defaulted.
+- **Let the database settle races.** A check in application code is an optimization; the partial unique index is the guarantee. Map its violation to a domain error and answer the loser as a replay.
+- **Return the same response shape on replay.** A header like `Idempotent-Replayed` is enough for debugging, and clients don't need a separate code path.
+- **What I'd change:** the fingerprint lives in a `useRef`, so a full page reload mints a new key and a resubmit after reload falls through to the lookalike check instead of a clean replay. The 2-minute window catches that case today, but persisting the pending key in session storage until the save succeeds would make the guarantee hold across reloads too. Keys also never expire; they sit on the transaction row, which is cheap here, but a high-volume API would want a separate key table with a TTL.
