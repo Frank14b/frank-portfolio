@@ -3,7 +3,7 @@ export const profile = {
   shortName: "Frank Fontcha",
   title: "Senior Full Stack Developer · Lead Software Engineer",
   location: "Dubai, UAE",
-  availability: "UAE employment visa · 30 days notice",
+  availability: "Founder, MboaSoft Solutions",
   email: "franckfontcha@gmail.com",
   phone: "+971 55 935 8866",
   linkedin: "https://www.linkedin.com/in/kamga-fontcha-frank-donald-485933ba",
@@ -17,7 +17,7 @@ export const profile = {
 export const stats = [
   { value: "8+", label: "years shipping production software" },
   { value: "500K+", label: "active users on a platform I re-architected" },
-  { value: "5K+", label: "Google Play downloads for Pro E-Farmer" },
+  { value: "10K+", label: "Google Play downloads for E-Farmer" },
   { value: "4", label: "engineers led on architecture and delivery" },
 ];
 

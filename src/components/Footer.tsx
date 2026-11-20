@@ -3,7 +3,7 @@ import { profile } from "@/content/profile";
 
 const apps = [
   {
-    name: "Pro E-Farmer",
+    name: "E-Farmer",
     url: "https://e-farmer.app",
     logo: "/logos/e-farmer.png",
     blurb: "AI-powered livestock & crop management",
