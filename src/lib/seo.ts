@@ -19,7 +19,8 @@ export const keywords = [
   "WebRTC engineer",
   "RAG / LLM engineer",
   "System design",
-  "Pro E-Farmer",
+  "E-Farmer",
+  "MboaSoft Solutions",
   "MboaMeet",
 ];
 

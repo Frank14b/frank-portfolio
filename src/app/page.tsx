@@ -195,7 +195,7 @@ export default function Home() {
             Need a lead engineer for a platform that has to scale?
           </h2>
           <p className="mt-4 max-w-xl text-paper/70">
-            I’m in Dubai on a UAE employment visa, with 30 days’ notice. Open to senior and lead roles and to architecture consulting.
+            I’m based in Dubai and I run MboaSoft Solutions, the company behind E-Farmer and MboaMeet. Open to architecture consulting and technical partnerships.
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
             <a href={`mailto:${profile.email}`} className="rounded-full bg-paper px-5 py-2.5 text-sm font-medium text-ink transition hover:opacity-90">

@@ -17,7 +17,7 @@ export type Project = {
 export const projects: Project[] = [
   {
     slug: "pro-e-farmer",
-    name: "Pro E-Farmer",
+    name: "E-Farmer",
     tagline: "AI-powered livestock and crop management with social commerce, on mobile, desktop and web.",
     role: "Founder · Lead engineer",
     period: "2025 — Present",
@@ -29,7 +29,7 @@ export const projects: Project[] = [
     kind: "Product",
     featured: true,
     highlights: [
-      "5,000+ downloads and 2,000+ active users on Google Play",
+      "10,000+ downloads on Google Play and 3,000+ active accounts",
       "Farm-scoped RAG assistant “Sora” on ChromaDB + sentence-transformers",
       "Electron desktop app that runs fully offline on node:sqlite",
       "8 languages including RTL (Arabic, Urdu)",
@@ -39,7 +39,7 @@ export const projects: Project[] = [
       "Expo / React Native", "Electron", "Angular", "Next.js", "Stripe", "FCM / APNs",
     ],
     description:
-      "Pro E-Farmer helps smallholder and commercial farmers run their farms. It tracks animals, crop cycles, feed, medication and expenses, forecasts breeding and laying, sells produce on a marketplace and answers questions about the farm through an AI assistant grounded in the farm's own records. I designed and built the whole system: the backend, the AI service, the mobile, desktop and web apps, and the data pipeline in between.",
+      "E-Farmer, built by MboaSoft Solutions, the company I founded in Douala, Cameroon, helps smallholder and commercial farmers run their farms. It tracks animals, crop cycles, feed, medication and expenses, forecasts breeding and laying, sells produce on a marketplace and answers questions about the farm through an AI assistant grounded in the farm's own records. I designed and built the whole system: the backend, the AI service, the mobile, desktop and web apps, and the data pipeline in between.",
     architecture: [
       "NestJS API (v1): about 30 domain modules (animals, crops, plots, eggs, wallets, marketplace, vets, chatbot, notifications, Telegram bot) built from use cases, services and adapters.",
       "Django + DRF AI service: RAG question answering over ChromaDB, structure-aware re-indexing, and Gemini vision helpers that turn a product photo into a listing.",
